@@ -271,6 +271,25 @@ def test_pin_hash_must_be_bcrypt(fresh_db: str):
       c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
 
 
+def test_pin_hash_check_survives_nonstandard_strings(admin_dsn: str):
+  # With standard_conforming_strings off, a backslash in the CHECK's literal is an escape, and the stored pattern changes.
+  name = f"tcs_{uuid4().hex}"
+  with psycopg.connect(admin_dsn, autocommit=True) as admin:
+    admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+  try:
+    with psycopg.connect(make_conninfo(admin_dsn, dbname=name), autocommit=True) as c:
+      c.execute("SET standard_conforming_strings = off")
+      for m in load_migrations():
+        with c.transaction():
+          c.execute(cast("LiteralString", m.sql))  # package data, not user input
+      _add_employee(c)  # crypt('1234', gen_salt('bf'))
+      with pytest.raises(errors.CheckViolation):
+        c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
 def test_every_table_loads_into_its_model(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO groups (name) VALUES ('night')")
