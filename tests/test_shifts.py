@@ -167,6 +167,14 @@ def test_worked_time_open_shift_counts_until_now():
   assert worked_time(on_break, *week, now=T + 2 * H, subtract_lunch=True, subtract_breaks=True) == H
 
 
+def test_worked_time_now_before_closed_lunch_ends():
+  tl = build_timeline([punch(CLOCK_IN, T), punch(LUNCH_START, T + H), punch(LUNCH_END, T + 2 * H)])
+  week = week_bounds(T, NY)
+  assert worked_time(tl, *week, now=T - H, subtract_lunch=True, subtract_breaks=False) == timedelta()
+  assert worked_time(tl, *week, now=T + H + 30 * M, subtract_lunch=True, subtract_breaks=False) == H
+  assert worked_time(tl, *week, now=T + 3 * H, subtract_lunch=True, subtract_breaks=False) == 2 * H
+
+
 def test_worked_time_splits_at_week_boundary():
   sunday_night = datetime(2026, 11, 8, 22, 0, tzinfo=NY)  # 2026-11-09 03:00 UTC
   tl = build_timeline([punch(CLOCK_IN, sunday_night), punch(CLOCK_OUT, sunday_night + 4 * H)])
