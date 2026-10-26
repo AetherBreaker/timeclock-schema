@@ -21,14 +21,29 @@ import psycopg
 import pytest
 from psycopg import errors, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
 
 # First party imports
 from timeclock_schema.migrations import load_migrations
+from timeclock_schema.models import (
+  BusinessHours,
+  Employee,
+  Fingerprint,
+  Group,
+  Override,
+  Punch,
+  PunchCorrection,
+  RuleRow,
+  Settings,
+)
 from timeclock_schema.wire import NOTIFY_CHANNEL, Notification, NotifyTable
 
 if TYPE_CHECKING:
   # Standard library imports
   from collections.abc import Generator, Iterator
+
+  # First party imports
+  from timeclock_schema.base import TimeclockModel
 
 pytestmark = pytest.mark.skipif(
   not os.environ.get("TIMECLOCK_SCHEMA_TEST_DSN"), reason="needs TIMECLOCK_SCHEMA_TEST_DSN (see module docstring)"
@@ -254,3 +269,49 @@ def test_pin_hash_must_be_bcrypt(fresh_db: str):
     _add_employee(c)  # crypt('1234', gen_salt('bf'))
     with pytest.raises(errors.CheckViolation):
       c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
+
+
+def test_every_table_loads_into_its_model(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO groups (name) VALUES ('night')")
+    employee_id, manager_id = _add_employee(c), _add_employee(c, "Bob", "34")
+    punch_id = _add_punch(c, employee_id)
+    c.execute(
+      "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id) VALUES (%s, %s, %s, %s, '1')",
+      (uuid4(), employee_id, b"tmpl", T),
+    )
+    c.execute("INSERT INTO punch_corrections (punch_id, action, new_at) VALUES (%s, 'amend', %s)", (punch_id, T))
+    c.execute(
+      "INSERT INTO overrides (id, punch_id, employee_id, manager_id, reason, pin_only, at, instance_id)"
+      " VALUES (%s, %s, %s, %s, 'fingerprint_skipped', true, %s, '1')",
+      (uuid4(), punch_id, employee_id, manager_id, T),
+    )
+    c.execute("""INSERT INTO rules (kind, params, employee_id, on_violation) VALUES ('k', '{"n": 1}', %s, 'refuse')""", (employee_id,))
+    c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
+    tables: list[tuple[LiteralString, type[TimeclockModel]]] = [
+      ("groups", Group),
+      ("employees", Employee),
+      ("fingerprints", Fingerprint),
+      ("punches", Punch),
+      ("punch_corrections", PunchCorrection),
+      ("overrides", Override),
+      ("rules", RuleRow),
+      ("config.business_hours", BusinessHours),
+      ("config.settings", Settings),
+    ]
+    with c.cursor(row_factory=dict_row) as cur:
+      loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
+  assert {table: len(rows) for table, rows in loaded.items()} == {
+    "groups": 2,
+    "employees": 2,
+    "fingerprints": 1,
+    "punches": 1,
+    "punch_corrections": 1,
+    "overrides": 1,
+    "rules": 1,
+    "config.business_hours": 1,
+    "config.settings": 1,
+  }
+  assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
+  assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
+  assert loaded["fingerprints"][0].model_dump()["template"].get_secret_value() == b"tmpl"
