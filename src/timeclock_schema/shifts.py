@@ -213,11 +213,17 @@ def worked_time(
   start, end, now = start.astimezone(UTC), end.astimezone(UTC), now.astimezone(UTC)
   total = timedelta()
   for shift in timeline.shifts:
-    spans = [(1, shift.clock_in.at, now if shift.clock_out is None else shift.clock_out.at)]
+    lo = max(shift.clock_in.at, start)
+    hi = min(now if shift.clock_out is None else shift.clock_out.at, end)
+    if hi <= lo:
+      continue
+    total += hi - lo
+    # Clip intervals to the shift's counted span, not just the window: a closed interval can end after `now` (clock skew,
+    # a future-dated amend), and subtracting beyond the span would under-count or go negative.
     subtracted = (shift.lunches if subtract_lunch else ()) + (shift.breaks if subtract_breaks else ())
-    spans += [(-1, interval.start, now if interval.end is None else interval.end) for interval in subtracted]
-    for sign, span_start, span_end in spans:
-      total += sign * max(min(span_end, end) - max(span_start, start), timedelta())
+    for interval in subtracted:
+      interval_end = now if interval.end is None else interval.end
+      total -= max(min(interval_end, hi) - max(interval.start, lo), timedelta())
   return total
 
 
