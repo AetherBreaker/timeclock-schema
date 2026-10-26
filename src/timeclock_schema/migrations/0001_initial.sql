@@ -1,6 +1,6 @@
--- timeclock-schema 0001: the tables, view, triggers and grants of design §4, except `schema_migrations`, which the
--- backend's runner creates (§8.3). Plain SQL: runs unchanged in `timeclock` and `timeclock_test` (R26.6). Roles are
--- server-wide, so the one role is created only if absent.
+-- timeclock-schema 0001: the tables, view and triggers of design §4, and the role `timeclock_clock_access` (created
+-- only if absent, since roles are server-wide) with its grants. Plain SQL: runs unchanged in `timeclock` and
+-- `timeclock_test` (R26.6). The backend's runner owns `schema_migrations`, the group roles and the `CONNECT` grants (§8.3).
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- crypt()/gen_salt('bf') for PIN hashes (R23.1)
 
@@ -27,7 +27,7 @@ CREATE TABLE employees (
   pin_username text NOT NULL UNIQUE CHECK (pin_username ~ '^[0-9]+$'),
   -- Only a bcrypt hash (R23.1): the owner types rows by hand, and a plain PIN must never be stored. Checked here, not in
   -- the model, since a failing validator would echo the PIN in its error.
-  pin_hash     text NOT NULL CHECK (pin_hash ~ '^\$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'),
+  pin_hash     text NOT NULL CHECK (pin_hash ~ '^[$]2[abxy][$][0-9]{2}[$][./A-Za-z0-9]{53}$'),
   is_manager   boolean NOT NULL DEFAULT false,
   active       boolean NOT NULL DEFAULT true,
   group_id     bigint NOT NULL DEFAULT 1 REFERENCES groups (id),
@@ -90,7 +90,8 @@ CREATE TABLE overrides (
 CREATE TABLE rules (
   id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   kind         text NOT NULL,
-  -- An object, so a bad row fails `validate_rule` (skip and alert, §4.6) rather than loading into `RuleRow` at all.
+  -- A non-object would fail to load into `RuleRow` at all; as an object every row loads, and a bad one fails
+  -- `validate_rule` (skip and alert, §4.6).
   params       jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(params) = 'object'),
   group_id     bigint REFERENCES groups (id),
   employee_id  bigint REFERENCES employees (id),
