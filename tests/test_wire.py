@@ -18,8 +18,9 @@ def test_notification_parses_trigger_payloads():
   n = Notification.model_validate_json('{"table": "config.settings", "op": "UPDATE", "id": "true"}')
   assert (n.table, n.op, n.id) == ("config.settings", "UPDATE", "true")
   assert Notification.model_validate_json('{"table": "employees", "op": "DELETE", "id": "7"}').id == "7"
+  assert Notification.model_validate_json('{"table": "added_later", "op": "INSERT", "id": "x"}').table == "added_later"
   with pytest.raises(ValidationError):
-    Notification.model_validate_json('{"table": "overrides", "op": "INSERT", "id": "x"}')
+    Notification.model_validate_json('{"table": "employees", "op": "TRUNCATE", "id": "x"}')
 
 
 def test_lan_punch_round_trip():
