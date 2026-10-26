@@ -1,5 +1,6 @@
--- timeclock-schema 0001: every table, view, trigger and grant of design §4. Plain SQL: runs unchanged in
--- `timeclock` and `timeclock_test` (R26.6). Roles are server-wide, so the one role is created only if absent.
+-- timeclock-schema 0001: the tables, view, triggers and grants of design §4, except `schema_migrations`, which the
+-- backend's runner creates (§8.3). Plain SQL: runs unchanged in `timeclock` and `timeclock_test` (R26.6). Roles are
+-- server-wide, so the one role is created only if absent.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- crypt()/gen_salt('bf') for PIN hashes (R23.1)
 
@@ -24,7 +25,9 @@ CREATE TABLE employees (
   id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   name         text NOT NULL,
   pin_username text NOT NULL UNIQUE CHECK (pin_username ~ '^[0-9]+$'),
-  pin_hash     text NOT NULL,
+  -- Only a bcrypt hash (R23.1): the owner types rows by hand, and a plain PIN must never be stored. Checked here, not in
+  -- the model, since a failing validator would echo the PIN in its error.
+  pin_hash     text NOT NULL CHECK (pin_hash ~ '^\$2[abxy]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'),
   is_manager   boolean NOT NULL DEFAULT false,
   active       boolean NOT NULL DEFAULT true,
   group_id     bigint NOT NULL DEFAULT 1 REFERENCES groups (id),
@@ -87,7 +90,8 @@ CREATE TABLE overrides (
 CREATE TABLE rules (
   id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   kind         text NOT NULL,
-  params       jsonb NOT NULL DEFAULT '{}',
+  -- An object, so a bad row fails `validate_rule` (skip and alert, §4.6) rather than loading into `RuleRow` at all.
+  params       jsonb NOT NULL DEFAULT '{}' CHECK (jsonb_typeof(params) = 'object'),
   group_id     bigint REFERENCES groups (id),
   employee_id  bigint REFERENCES employees (id),
   on_violation rule_action NOT NULL,
@@ -99,12 +103,14 @@ CREATE TRIGGER rules_updated_at BEFORE UPDATE ON rules FOR EACH ROW EXECUTE FUNC
 CREATE SCHEMA config;
 
 -- Seeded empty: a new install's reader sleeps until hours are added (§4.3).
+-- Here and in config.settings, `time` accepts '24:00' but psycopg can't load it (Python's `time` has no hour 24), and
+-- one such row breaks every clock's catch-up; midnight is written '23:59:59'.
 CREATE TABLE config.business_hours (
   id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   weekday smallint NOT NULL CHECK (weekday BETWEEN 1 AND 7),
   opens   time NOT NULL,
   closes  time NOT NULL,
-  CHECK (opens < closes)
+  CHECK (opens < closes AND closes < '24:00')
 );
 
 CREATE TABLE config.settings (
@@ -113,7 +119,8 @@ CREATE TABLE config.settings (
   auto_clock_out_run_time   time NOT NULL DEFAULT '23:00:00',
   auto_clock_out_stamp_time time NOT NULL DEFAULT '23:00:00',
   subtract_lunch            boolean NOT NULL DEFAULT true,
-  subtract_breaks           boolean NOT NULL DEFAULT false
+  subtract_breaks           boolean NOT NULL DEFAULT false,
+  CHECK (auto_clock_out_run_time < '24:00' AND auto_clock_out_stamp_time < '24:00')
 );
 INSERT INTO config.settings DEFAULT VALUES;
 

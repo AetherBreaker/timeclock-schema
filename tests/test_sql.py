@@ -115,7 +115,7 @@ def test_seed_rows(fresh_db: str):
 def test_employee_defaults_and_updated_at(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     with pytest.raises(errors.CheckViolation):
-      c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12a', 'x')")
+      c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12a', crypt('1234', gen_salt('bf')))")
     row = c.execute(
       "INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12', crypt('1234', gen_salt('bf')))"
       " RETURNING id, group_id, is_manager, active, updated_at"
@@ -179,7 +179,7 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
       ("UPDATE punches SET at = now()", False),
       ("DELETE FROM punches", False),
       ("SELECT * FROM overrides", False),
-      ("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Eve', '99', 'x')", False),
+      ("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Eve', '99', crypt('1234', gen_salt('bf')))", False),
       ("UPDATE config.settings SET subtract_breaks = true", False),
     ]
     for sql, takes_punch in forbidden:
@@ -218,3 +218,29 @@ def test_punch_log_shows_current_name_and_latest_correction(fresh_db: str):
     c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s", (employee_id,))
     row = c.execute("SELECT employee_name, correction, db_login FROM punch_log WHERE id = %s", (punch_id,)).fetchone()
   assert row == ("Ann B", "amend", "postgres")
+
+
+@pytest.mark.parametrize(
+  "statement",
+  [
+    "INSERT INTO config.business_hours (weekday, opens, closes) VALUES (1, '09:00', '24:00')",
+    "UPDATE config.settings SET auto_clock_out_run_time = '24:00'",
+    "UPDATE config.settings SET auto_clock_out_stamp_time = '24:00'",
+  ],
+)
+def test_time_columns_reject_24_00(fresh_db: str, statement: LiteralString):
+  with psycopg.connect(fresh_db, autocommit=True) as c, pytest.raises(errors.CheckViolation):
+    c.execute(statement)
+
+
+@pytest.mark.parametrize("params", ["null", "[]", "5", '"x"'])
+def test_rule_params_must_be_an_object(fresh_db: str, params: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c, pytest.raises(errors.CheckViolation):
+    c.execute("INSERT INTO rules (kind, params, group_id, on_violation) VALUES ('k', %s::jsonb, 1, 'warn')", (params,))
+
+
+def test_pin_hash_must_be_bcrypt(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _add_employee(c)  # crypt('1234', gen_salt('bf'))
+    with pytest.raises(errors.CheckViolation):
+      c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
