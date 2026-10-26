@@ -4,7 +4,7 @@
 import base64
 from datetime import time
 from typing import Annotated, Any, Self
-from uuid import UUID  # noqa: TC003 - pydantic resolves field annotations at class creation
+from uuid import UUID
 
 # Third party imports
 from pydantic import (
