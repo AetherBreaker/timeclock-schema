@@ -138,26 +138,11 @@ def apply_corrections(punches: Iterable[Punch], corrections: Iterable[PunchCorre
   return sorted(effective, key=lambda e: (e.at, e.id))
 
 
-def _drop_overridden_clock_outs(punches: list[EffectivePunch]) -> list[EffectivePunch]:
-  """Drop the automatic clock-outs of each segment that has a real one, in either order (R41.2).
-
-  A segment runs from one clock-in to the next; punches before the first clock-in form their own. Split out of
-  `build_timeline` for C901.
-  """
-  segments: list[list[EffectivePunch]] = []
-  for p in punches:
-    if p.kind is PunchKind.CLOCK_IN or not segments:
-      segments.append([])
-    segments[-1].append(p)
-  kept: list[EffectivePunch] = []
-  for segment in segments:
-    has_real_out = any(p.kind is PunchKind.CLOCK_OUT and not p.automatic for p in segment)
-    kept.extend(p for p in segment if not (has_real_out and p.kind is PunchKind.CLOCK_OUT and p.automatic))
-  return kept
-
-
 def build_timeline(punches: Iterable[Punch], corrections: Iterable[PunchCorrection] = ()) -> Timeline:
   """Walk one employee's corrected punches through the state machine.
+
+  A punch not valid from the current state is an anomaly, so of two consecutive same-type punches the oldest counts,
+  automatic or not (R41.2).
 
   Raises:
     ValueError: The punches belong to more than one employee.
@@ -165,7 +150,7 @@ def build_timeline(punches: Iterable[Punch], corrections: Iterable[PunchCorrecti
   punches = list(punches)
   if len({p.employee_id for p in punches}) > 1:
     raise ValueError("punches from more than one employee")
-  events = _drop_overridden_clock_outs(apply_corrections(punches, corrections))
+  events = apply_corrections(punches, corrections)
   state = EmployeeState.OFF
   shifts: list[Shift] = []
   anomalies: list[Anomaly] = []

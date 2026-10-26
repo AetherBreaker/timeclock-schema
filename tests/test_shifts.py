@@ -85,25 +85,30 @@ def test_invalid_punches_are_anomalies():
   assert tl.state is EmployeeState.WORKING and tl.last_event_at == T + H
 
 
-def test_real_clock_out_overrides_automatic_either_order():
-  later_real = build_timeline([punch(CLOCK_IN, T), punch(CLOCK_OUT, T + 10 * H, automatic=True), punch(CLOCK_OUT, T + 11 * H)])
-  later_out = later_real.shifts[0].clock_out
-  assert later_out is not None
-  assert later_out.at == T + 11 * H and not later_out.automatic and later_real.anomalies == ()
-  earlier_real = build_timeline([punch(CLOCK_IN, T), punch(CLOCK_OUT, T + 8 * H), punch(CLOCK_OUT, T + 10 * H, automatic=True)])
-  earlier_out = earlier_real.shifts[0].clock_out
-  assert earlier_out is not None
-  assert earlier_out.at == T + 8 * H and earlier_real.anomalies == ()
-
-
-def test_real_clock_out_overrides_automatic_after_stray_clock_in():
-  # The stray clock-in starts the segment holding both clock-outs, so the real one still drops the automatic one.
-  stray_in, real_out = punch(CLOCK_IN, T + 2 * H), punch(CLOCK_OUT, T + 11 * H)
-  tl = build_timeline([punch(CLOCK_IN, T), stray_in, punch(CLOCK_OUT, T + 10 * H, automatic=True), real_out])
+def test_automatic_clock_out_stands_against_a_later_real_one():
+  monday = T - 24 * H  # Monday 08:00 EDT
+  auto_out, real_out = punch(CLOCK_OUT, monday + 15 * H, automatic=True), punch(CLOCK_OUT, T)
+  tl = build_timeline([punch(CLOCK_IN, monday), auto_out, real_out])
   assert len(tl.shifts) == 1 and tl.state is EmployeeState.OFF
   clock_out = tl.shifts[0].clock_out
-  assert clock_out is not None and clock_out.id == real_out.id and tl.shifts[0].clock_in.at == T
-  assert [(a.punch.id, a.state) for a in tl.anomalies] == [(stray_in.id, EmployeeState.WORKING)]
+  assert clock_out is not None and clock_out.id == auto_out.id
+  assert worked_time(tl, monday, T + H, now=T + H, subtract_lunch=True, subtract_breaks=True) == 15 * H
+  assert [(a.punch.id, a.state) for a in tl.anomalies] == [(real_out.id, EmployeeState.OFF)]
+
+
+def test_real_clock_out_stands_against_a_later_automatic_one():
+  real_out, auto_out = punch(CLOCK_OUT, T + 9 * H), punch(CLOCK_OUT, T + 15 * H, automatic=True)
+  tl = build_timeline([punch(CLOCK_IN, T), real_out, auto_out])
+  clock_out = tl.shifts[0].clock_out
+  assert clock_out is not None and clock_out.id == real_out.id
+  assert [(a.punch.id, a.state) for a in tl.anomalies] == [(auto_out.id, EmployeeState.OFF)]
+
+
+def test_oldest_of_two_consecutive_same_type_punches_counts():
+  later_start = punch(BREAK_START, T + 2 * H + 5 * M)
+  tl = build_timeline([punch(CLOCK_IN, T), punch(BREAK_START, T + 2 * H), later_start, punch(BREAK_END, T + 2 * H + 15 * M)])
+  assert tl.shifts[0].breaks == (Interval(start=T + 2 * H, end=T + 2 * H + 15 * M),)
+  assert [(a.punch.id, a.state) for a in tl.anomalies] == [(later_start.id, EmployeeState.ON_BREAK)]
 
 
 def test_lone_automatic_clock_out_closes_the_shift():
