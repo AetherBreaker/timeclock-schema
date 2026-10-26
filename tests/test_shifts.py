@@ -42,6 +42,11 @@ def test_valid_next_matches_spec_table():
   }
 
 
+def test_valid_next_follows_the_state():
+  assert build_timeline([punch(CLOCK_IN, T)]).valid_next == (CLOCK_OUT, BREAK_START, LUNCH_START)
+  assert build_timeline([]).valid_next == (CLOCK_IN,)
+
+
 def test_clock_in_then_out_closes_one_shift():
   tl = build_timeline([punch(CLOCK_IN, T), punch(CLOCK_OUT, T + 8 * H)])
   clock_out = tl.shifts[0].clock_out
@@ -89,6 +94,16 @@ def test_real_clock_out_overrides_automatic_either_order():
   earlier_out = earlier_real.shifts[0].clock_out
   assert earlier_out is not None
   assert earlier_out.at == T + 8 * H and earlier_real.anomalies == ()
+
+
+def test_real_clock_out_overrides_automatic_after_stray_clock_in():
+  # The stray clock-in starts the segment holding both clock-outs, so the real one still drops the automatic one.
+  stray_in, real_out = punch(CLOCK_IN, T + 2 * H), punch(CLOCK_OUT, T + 11 * H)
+  tl = build_timeline([punch(CLOCK_IN, T), stray_in, punch(CLOCK_OUT, T + 10 * H, automatic=True), real_out])
+  assert len(tl.shifts) == 1 and tl.state is EmployeeState.OFF
+  clock_out = tl.shifts[0].clock_out
+  assert clock_out is not None and clock_out.id == real_out.id and tl.shifts[0].clock_in.at == T
+  assert [(a.punch.id, a.state) for a in tl.anomalies] == [(stray_in.id, EmployeeState.WORKING)]
 
 
 def test_lone_automatic_clock_out_closes_the_shift():
@@ -182,6 +197,20 @@ def test_worked_time_splits_at_week_boundary():
   assert this_week[1] == datetime(2026, 11, 9, 5, 0, tzinfo=UTC) == next_week[0]
   for bounds in (this_week, next_week):
     assert worked_time(tl, *bounds, now=sunday_night + 5 * H, subtract_lunch=True, subtract_breaks=False) == 2 * H
+
+
+def test_worked_time_clips_lunch_straddling_the_week_boundary():
+  sunday_night = datetime(2026, 11, 8, 22, 0, tzinfo=NY)
+  tl = build_timeline(
+    [
+      punch(CLOCK_IN, sunday_night),
+      punch(LUNCH_START, sunday_night + 90 * M),  # 23:30, half an hour before the boundary
+      punch(LUNCH_END, sunday_night + 150 * M),  # 00:30
+      punch(CLOCK_OUT, sunday_night + 4 * H),
+    ]
+  )
+  for bounds in (week_bounds(sunday_night, NY), week_bounds(sunday_night + 4 * H, NY)):
+    assert worked_time(tl, *bounds, now=sunday_night + 5 * H, subtract_lunch=True, subtract_breaks=False) == 90 * M
 
 
 def test_week_bounds_across_dst():
