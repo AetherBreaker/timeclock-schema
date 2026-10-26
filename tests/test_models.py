@@ -98,6 +98,7 @@ def test_settings_defaults_match_the_seed_row():
 
 def test_auto_clock_out_rejects_stamp_after_run():
   assert Settings(auto_clock_out_run_time=time(23), auto_clock_out_stamp_time=time(18)).auto_clock_out().stamp_time == time(18)
+  assert Settings(auto_clock_out_run_time=time(23), auto_clock_out_stamp_time=time(23)).auto_clock_out().stamp_time == time(23)
   bad = Settings(auto_clock_out_run_time=time(2), auto_clock_out_stamp_time=time(23))  # the row itself still loads
   with pytest.raises(ValidationError):
     bad.auto_clock_out()
