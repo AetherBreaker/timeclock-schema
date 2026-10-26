@@ -13,7 +13,7 @@ skipped. Each test gets its own freshly migrated database, dropped afterwards.
 import os
 from contextlib import contextmanager
 from datetime import UTC, datetime, time
-from typing import TYPE_CHECKING, LiteralString, cast
+from typing import TYPE_CHECKING, LiteralString, cast, get_args
 from uuid import uuid4
 
 # Third party imports
@@ -24,7 +24,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 # First party imports
 from timeclock_schema.migrations import load_migrations
-from timeclock_schema.wire import NOTIFY_CHANNEL, Notification
+from timeclock_schema.wire import NOTIFY_CHANNEL, Notification, NotifyTable
 
 if TYPE_CHECKING:
   # Standard library imports
@@ -146,6 +146,16 @@ def test_notify_payloads(fresh_db: str):
     ("employees", "DELETE", employee_id),
     ("config.settings", "UPDATE", "true"),
   ]
+
+
+def test_notify_triggers_cover_notify_table(fresh_db: str):
+  with psycopg.connect(fresh_db) as c:
+    rows = c.execute(
+      "SELECT DISTINCT CASE WHEN n.nspname = 'public' THEN r.relname ELSE n.nspname || '.' || r.relname END"
+      " FROM pg_trigger t JOIN pg_class r ON r.oid = t.tgrelid JOIN pg_namespace n ON n.oid = r.relnamespace"
+      " JOIN pg_proc p ON p.oid = t.tgfoid WHERE p.proname = 'notify_change' AND NOT t.tgisinternal"
+    ).fetchall()
+  assert {table for (table,) in rows} == set(get_args(NotifyTable))
 
 
 def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):

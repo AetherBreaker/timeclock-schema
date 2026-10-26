@@ -15,13 +15,15 @@ NOTIFY_CHANNEL: Final = "timeclock"
 NotifyTable = Literal[
   "employees", "groups", "fingerprints", "punches", "punch_corrections", "rules", "config.business_hours", "config.settings"
 ]
-"""Every table a clock mirrors; the trigger function fires on each."""
+"""The tables 0001 notifies on, which a clock mirrors. `Notification.table` accepts any name (see there)."""
 
 
 class Notification(TimeclockModel):
   """A trigger's `NOTIFY timeclock` payload. It carries only the row ID so a template never nears the 8,000-byte limit."""
 
-  table: NotifyTable
+  table: str
+  """Usually a `NotifyTable`. Plain `str` for the reason behind `extra="ignore"`: a newer migration's notifying table must
+  not make an older clock fail on every notification; receivers ignore tables they don't know."""
   op: Literal["INSERT", "UPDATE", "DELETE"]
   id: str
   """Always text (an integer, a UUID, or `"true"` for `config.settings`); the receiver converts per table."""
