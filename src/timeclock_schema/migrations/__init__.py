@@ -27,13 +27,16 @@ def load_migrations() -> tuple[Migration, ...]:
   """Every migration in the package, by version.
 
   Raises:
-    ValueError: The versions aren't exactly 1..n (a version is missing or repeated).
+    ValueError: A `.sql` file is misnamed or numbered 0000, or the versions aren't exactly 1..n (a version is missing or
+      repeated). A misnamed file is an error, not skipped, so a migration can't silently go unapplied.
   """
-  found = [
-    Migration(version=int(match[1]), name=match[2], sql=entry.read_text(encoding="utf-8"))
-    for entry in files(__package__).iterdir()
-    if (match := _FILE_NAME.match(entry.name))
-  ]
+  found: list[Migration] = []
+  for entry in files(__package__).iterdir():
+    if not entry.name.endswith(".sql"):
+      continue
+    if not (match := _FILE_NAME.match(entry.name)) or int(match[1]) < 1:
+      raise ValueError(f"migration file {entry.name!r} doesn't match NNNN_name.sql (NNNN from 0001, name in [a-z0-9_])")
+    found.append(Migration(version=int(match[1]), name=match[2], sql=entry.read_text(encoding="utf-8")))
   found.sort(key=lambda m: m.version)
   if duplicates := sorted(v for v, count in Counter(m.version for m in found).items() if count > 1):
     raise ValueError(f"duplicate migration version {duplicates[0]}")

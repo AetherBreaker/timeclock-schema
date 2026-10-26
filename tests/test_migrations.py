@@ -29,9 +29,12 @@ def test_versions_are_contiguous():
     (["0001_initial.sql", "0003_later.sql"], "missing migration version 2"),
     (["0002_second.sql"], "missing migration version 1"),
     (["0001_initial.sql", "0001_again.sql"], "duplicate migration version 1"),
+    (["0001_initial.sql", "0002_add-index.sql"], "0002_add-index.sql"),
+    (["0001_initial.sql", "2_short.sql"], "2_short.sql"),
+    (["0000_x.sql", "0001_initial.sql"], "0000_x.sql"),
   ],
 )
-def test_gaps_and_duplicates_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, names: list[str], message: str):
+def test_bad_migration_sets_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, names: list[str], message: str):
   for name in [*names, "README.txt", "__init__.py"]:
     (tmp_path / name).write_text("SELECT 1;")
   monkeypatch.setattr(timeclock_schema.migrations, "files", lambda _package: tmp_path)
