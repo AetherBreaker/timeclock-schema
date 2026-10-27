@@ -353,32 +353,6 @@ def test_every_table_loads_into_its_model(fresh_db: str):
   assert loaded["fingerprints"][0].model_dump()["template"].get_secret_value() == b"tmpl"
 
 
-@pytest.mark.parametrize(
-  ("wall", "zone", "expected"),
-  [
-    ("2026-10-27 23:00", "America/New_York", datetime(2026, 10, 28, 3, 0, tzinfo=UTC)),  # an ordinary day
-    ("2026-03-08 02:30", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),  # skipped: runs at 03:00 EDT
-    ("2026-03-08 02:00", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
-    ("2026-03-08 02:59:59", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
-    ("2026-03-08 01:59:59", "America/New_York", datetime(2026, 3, 8, 6, 59, 59, tzinfo=UTC)),
-    ("2026-03-08 03:00", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
-    ("2026-03-08 23:00", "America/New_York", datetime(2026, 3, 9, 3, 0, tzinfo=UTC)),
-    ("2026-11-01 01:30", "America/New_York", datetime(2026, 11, 1, 5, 30, tzinfo=UTC)),  # repeated: the first (EDT)
-    ("2026-11-01 01:00", "America/New_York", datetime(2026, 11, 1, 5, 0, tzinfo=UTC)),
-    ("2026-11-01 00:59", "America/New_York", datetime(2026, 11, 1, 4, 59, tzinfo=UTC)),
-    ("2026-11-01 02:00", "America/New_York", datetime(2026, 11, 1, 7, 0, tzinfo=UTC)),
-    ("2026-11-01 23:00", "America/New_York", datetime(2026, 11, 2, 4, 0, tzinfo=UTC)),
-    ("2026-10-04 02:15", "Australia/Lord_Howe", datetime(2026, 10, 3, 15, 30, tzinfo=UTC)),  # a 30-minute gap
-    ("2026-04-05 01:45", "Australia/Lord_Howe", datetime(2026, 4, 4, 14, 45, tzinfo=UTC)),
-    ("2026-10-27 23:00", "UTC", datetime(2026, 10, 27, 23, 0, tzinfo=UTC)),
-  ],
-)
-def test_resolve_local_time(fresh_db: str, wall: str, zone: str, expected: datetime):
-  with psycopg.connect(fresh_db) as c:
-    c.execute("SET TIME ZONE 'Asia/Tokyo'")  # the session's zone must not matter
-    assert c.execute("SELECT backend.resolve_local_time(%s::timestamp, %s)", (wall, zone)).fetchone() == (expected,)
-
-
 def test_run_row_checks(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     insert = (
@@ -395,7 +369,6 @@ def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login:
     statements: list[LiteralString] = [
       "SELECT * FROM backend.auto_clock_out_runs",
       "SELECT * FROM backend.environment",
-      "SELECT backend.resolve_local_time('2026-10-27 23:00', 'UTC')",
       "SELECT backend.project_auto_clock_out_runs()",
     ]
     for statement in statements:
@@ -508,8 +481,10 @@ def test_missed_row_is_kept_and_today_not_duplicated(fresh_db: str):
     assert _runs(c)[1:] == _days(date(2026, 10, 28), time(23, 30), time(23, 30))[:6]
 
 
-def test_dst_weeks_follow_rule_six(fresh_db: str):
+def test_dst_weeks_use_postgres_resolution(fresh_db: str):
+  # Owner, 2026-10-27: Postgres's own AT TIME ZONE. Skipped times move forward by the gap, repeated ones take the second.
   with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("SET TIME ZONE 'Asia/Tokyo'")  # the session's zone must not matter
     _as_of_only(c)
     c.execute("UPDATE config.settings SET auto_clock_out_run_time = '02:30', auto_clock_out_stamp_time = '02:15'")
     _project(c, "2026-03-06 12:00-05")
@@ -517,16 +492,23 @@ def test_dst_weeks_follow_rule_six(fresh_db: str):
     assert spring == [
       (datetime(2026, 3, 6, 7, 30, tzinfo=UTC), datetime(2026, 3, 6, 7, 15, tzinfo=UTC)),
       (datetime(2026, 3, 7, 7, 30, tzinfo=UTC), datetime(2026, 3, 7, 7, 15, tzinfo=UTC)),
-      (datetime(2026, 3, 8, 7, 0, tzinfo=UTC), datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),  # both skipped: 03:00 EDT
+      (datetime(2026, 3, 8, 7, 30, tzinfo=UTC), datetime(2026, 3, 8, 7, 15, tzinfo=UTC)),  # both skipped: 03:30/03:15 EDT
       (datetime(2026, 3, 9, 6, 30, tzinfo=UTC), datetime(2026, 3, 9, 6, 15, tzinfo=UTC)),
     ]
+    c.execute("DELETE FROM backend.auto_clock_out_runs")
+    # Only the stamp is skipped, and it moves past the run time: capped at the run time, not a CHECK failure.
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '03:00', auto_clock_out_stamp_time = '02:30'")
+    _project(c, "2026-03-06 12:00-05")
+    assert c.execute(
+      "SELECT scheduled_for, stamp FROM backend.auto_clock_out_runs WHERE (scheduled_for AT TIME ZONE scheduled_tz)::date = '2026-03-08'"
+    ).fetchall() == [(datetime(2026, 3, 8, 7, 0, tzinfo=UTC), datetime(2026, 3, 8, 7, 0, tzinfo=UTC))]
     c.execute("DELETE FROM backend.auto_clock_out_runs")
     c.execute("UPDATE config.settings SET auto_clock_out_run_time = '01:30', auto_clock_out_stamp_time = '01:00'")
     _project(c, "2026-10-30 12:00-04")
     fall = c.execute(
       "SELECT scheduled_for, stamp FROM backend.auto_clock_out_runs WHERE (scheduled_for AT TIME ZONE scheduled_tz)::date = '2026-11-01'"
     ).fetchall()
-    assert fall == [(datetime(2026, 11, 1, 5, 30, tzinfo=UTC), datetime(2026, 11, 1, 5, 0, tzinfo=UTC))]  # first occurrences
+    assert fall == [(datetime(2026, 11, 1, 6, 30, tzinfo=UTC), datetime(2026, 11, 1, 6, 0, tzinfo=UTC))]  # second occurrences (EST)
 
 
 def test_disabling_prunes_the_future_and_keeps_history(fresh_db: str):
