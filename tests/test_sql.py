@@ -12,7 +12,7 @@ skipped. Each test gets its own freshly migrated database, dropped afterwards.
 # Standard library imports
 import os
 from contextlib import contextmanager
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, LiteralString, cast, get_args
 from uuid import uuid4
 
@@ -322,10 +322,6 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     c.execute("""INSERT INTO rules (kind, params, employee_id, on_violation) VALUES ('k', '{"n": 1}', %s, 'refuse')""", (employee_id,))
     c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
     c.execute("INSERT INTO backend.environment (tz) VALUES ('UTC')")
-    c.execute(
-      "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, 2)",
-      (T, T, T),
-    )
     tables: list[tuple[LiteralString, type[TimeclockModel]]] = [
       ("groups", Group),
       ("employees", Employee),
@@ -350,7 +346,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     "rules": 1,
     "config.business_hours": 1,
     "config.settings": 1,
-    "backend.auto_clock_out_runs": 1,
+    "backend.auto_clock_out_runs": 7,
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
@@ -398,7 +394,182 @@ def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login:
       "SELECT * FROM backend.auto_clock_out_runs",
       "SELECT * FROM backend.environment",
       "SELECT backend.resolve_local_time('2026-10-27 23:00', 'UTC')",
+      "SELECT backend.project_auto_clock_out_runs()",
     ]:
       with pytest.raises(errors.InsufficientPrivilege):
         c.execute(statement)
     assert c.execute("SELECT auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings").fetchone() == ("daily", True, True)
+
+
+def _noon_zone() -> str:
+  """An Etc zone where it's now 12:xx, so a 23:00 run today is hours ahead whenever the test runs."""
+  offset = 12 - datetime.now(UTC).hour  # -11..12; Etc names invert the sign (Etc/GMT-5 is UTC+5)
+  return "UTC" if offset == 0 else f"Etc/GMT{-offset:+d}"
+
+
+def _runs(c: psycopg.Connection) -> list[tuple[datetime, datetime, str, bool]]:
+  """Each row's (local run time, local stamp, zone, has run), in time order."""
+  return c.execute(
+    "SELECT scheduled_for AT TIME ZONE scheduled_tz, stamp AT TIME ZONE scheduled_tz, scheduled_tz, ran_at IS NOT NULL"
+    " FROM backend.auto_clock_out_runs ORDER BY scheduled_for"
+  ).fetchall()
+
+
+def _local_today(c: psycopg.Connection, zone: str) -> date:
+  row = c.execute("SELECT (now() AT TIME ZONE %s)::date", (zone,)).fetchone()
+  assert row is not None
+  return row[0]
+
+
+def _as_of_only(c: psycopg.Connection) -> None:
+  """Disable both reprojection triggers, so only explicit `project_auto_clock_out_runs(as_of)` calls project, at fixed times."""
+  c.execute("ALTER TABLE config.settings DISABLE TRIGGER settings_reproject_auto_clock_out")
+  c.execute("ALTER TABLE backend.environment DISABLE TRIGGER environment_reproject_auto_clock_out")
+  c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+
+
+def _project(c: psycopg.Connection, as_of: str) -> None:
+  c.execute("SELECT backend.project_auto_clock_out_runs(%s::timestamptz)", (as_of,))
+
+
+def _days(start: date, run: time, stamp: time) -> list[tuple[datetime, datetime, str, bool]]:
+  """Seven unrun New York rows from `start`."""
+  return [
+    (datetime.combine(start + timedelta(days=i), run), datetime.combine(start + timedelta(days=i), stamp), "America/New_York", False)
+    for i in range(7)
+  ]
+
+
+def test_no_projection_until_the_backend_writes_a_zone(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("UPDATE config.settings SET subtract_breaks = true")  # no zone: must not fail (the clocks' own test databases)
+    assert _runs(c) == []
+
+
+def test_zone_insert_projects_seven_days(fresh_db: str):
+  zone = _noon_zone()
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (zone,))
+    today = _local_today(c, zone)
+    expected = [
+      (datetime.combine(today + timedelta(days=i), time(23)), datetime.combine(today + timedelta(days=i), time(23)), zone, False)
+      for i in range(7)
+    ]
+    assert _runs(c) == expected
+
+
+def test_todays_passed_run_time_is_still_projected(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    _project(c, "2026-10-27 23:30-04")
+    assert _runs(c) == _days(date(2026, 10, 27), time(23), time(23))
+
+
+def test_reprojection_never_touches_a_run_row(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    _project(c, "2026-10-27 22:00-04")
+    c.execute("UPDATE backend.auto_clock_out_runs SET ran_at = '2026-10-28 03:00:05Z', closed = 2 WHERE scheduled_for = '2026-10-28 03:00Z'")
+    ran = c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall()
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '22:30', auto_clock_out_stamp_time = '22:00'")
+    _project(c, "2026-10-27 23:40-04")
+    assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall() == ran
+    rows = _runs(c)
+    assert rows[0] == (datetime(2026, 10, 27, 23), datetime(2026, 10, 27, 23), "America/New_York", True)
+    assert rows[1:] == _days(date(2026, 10, 28), time(22, 30), time(22))[:6]
+
+
+def test_run_time_moved_into_the_past_projects_today_anyway(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    _project(c, "2026-10-27 20:00-04")
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '19:00', auto_clock_out_stamp_time = '18:00'")
+    _project(c, "2026-10-27 20:10-04")
+    assert _runs(c) == _days(date(2026, 10, 27), time(19), time(18))
+
+
+def test_missed_row_is_kept_and_today_not_duplicated(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    _project(c, "2026-10-27 20:00-04")
+    missed = c.execute("SELECT * FROM backend.auto_clock_out_runs ORDER BY scheduled_for LIMIT 1").fetchone()
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '23:30', auto_clock_out_stamp_time = '23:30'")
+    _project(c, "2026-10-27 23:10-04")  # 23:00 passed unrun (the backend was down): history, caught up with its own stamp
+    assert c.execute("SELECT * FROM backend.auto_clock_out_runs ORDER BY scheduled_for LIMIT 1").fetchone() == missed
+    assert _runs(c)[1:] == _days(date(2026, 10, 28), time(23, 30), time(23, 30))[:6]
+
+
+def test_dst_weeks_follow_rule_six(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '02:30', auto_clock_out_stamp_time = '02:15'")
+    _project(c, "2026-03-06 12:00-05")
+    spring = c.execute("SELECT scheduled_for, stamp FROM backend.auto_clock_out_runs ORDER BY scheduled_for LIMIT 4").fetchall()
+    assert spring == [
+      (datetime(2026, 3, 6, 7, 30, tzinfo=UTC), datetime(2026, 3, 6, 7, 15, tzinfo=UTC)),
+      (datetime(2026, 3, 7, 7, 30, tzinfo=UTC), datetime(2026, 3, 7, 7, 15, tzinfo=UTC)),
+      (datetime(2026, 3, 8, 7, 0, tzinfo=UTC), datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),  # both skipped: 03:00 EDT
+      (datetime(2026, 3, 9, 6, 30, tzinfo=UTC), datetime(2026, 3, 9, 6, 15, tzinfo=UTC)),
+    ]
+    c.execute("DELETE FROM backend.auto_clock_out_runs")
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '01:30', auto_clock_out_stamp_time = '01:00'")
+    _project(c, "2026-10-30 12:00-04")
+    fall = c.execute(
+      "SELECT scheduled_for, stamp FROM backend.auto_clock_out_runs WHERE (scheduled_for AT TIME ZONE scheduled_tz)::date = '2026-11-01'"
+    ).fetchall()
+    assert fall == [(datetime(2026, 11, 1, 5, 30, tzinfo=UTC), datetime(2026, 11, 1, 5, 0, tzinfo=UTC))]  # first occurrences
+
+
+def test_disabling_prunes_the_future_and_keeps_history(fresh_db: str):
+  zone = _noon_zone()
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (zone,))
+    c.execute(
+      "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES"
+      " (now() - interval '2 days', %s, now() - interval '50 hours', NULL, NULL),"
+      " (now() - interval '1 day', %s, now() - interval '25 hours', now() - interval '1 day', 0)",
+      (zone, zone),
+    )
+    history = c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE scheduled_for < now() ORDER BY id").fetchall()
+    c.execute("UPDATE config.settings SET auto_clock_out_enabled = false")
+    assert c.execute("SELECT * FROM backend.auto_clock_out_runs ORDER BY id").fetchall() == history
+    c.execute("UPDATE config.settings SET auto_clock_out_enabled = true")
+    assert c.execute("SELECT count(*) FROM backend.auto_clock_out_runs WHERE scheduled_for > now()").fetchone() == (7,)
+    assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE scheduled_for < now() ORDER BY id").fetchall() == history
+
+
+@pytest.mark.parametrize(
+  "statement",
+  [
+    "UPDATE config.settings SET auto_clock_out_run_time = '22:00', auto_clock_out_stamp_time = '23:00'",  # invalid (R41.3)
+    "DELETE FROM config.settings",
+  ],
+)
+def test_settings_that_cannot_project_prune_and_project_nothing(fresh_db: str, statement: LiteralString):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (_noon_zone(),))
+    c.execute(statement)
+    assert _runs(c) == []
+
+
+def test_zone_change_reprojects_and_keeps_run_rows(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (_noon_zone(),))
+    c.execute(
+      "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed)"
+      # 3 days back: a day-old New York date can be Chicago's today just after midnight, and would then hold today.
+      " VALUES (now() - interval '3 days', 'America/New_York', now() - interval '3 days', now() - interval '3 days', 1)"
+    )
+    ran = c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall()
+    c.execute("UPDATE backend.environment SET tz = 'America/Chicago'")
+    assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall() == ran
+    unrun = c.execute("SELECT DISTINCT scheduled_tz, count(*) OVER () FROM backend.auto_clock_out_runs WHERE ran_at IS NULL").fetchall()
+    assert unrun == [("America/Chicago", 7)]
+
+
+def test_unrelated_settings_edit_reprojects_identically(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (_noon_zone(),))
+    before = _runs(c)
+    c.execute("UPDATE config.settings SET subtract_breaks = true")
+    assert _runs(c) == before
