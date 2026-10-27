@@ -13,7 +13,8 @@ skipped. Each test gets its own freshly migrated database, dropped afterwards.
 import os
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
-from typing import TYPE_CHECKING, LiteralString, cast, get_args
+from decimal import Decimal
+from typing import TYPE_CHECKING, Annotated, LiteralString, cast, get_args
 from uuid import uuid4
 
 # Third party imports
@@ -22,16 +23,19 @@ import pytest
 from psycopg import errors, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
+from pydantic import StringConstraints, TypeAdapter, ValidationError
 
 # First party imports
 from timeclock_schema.migrations import load_migrations
 from timeclock_schema.models import (
+  EMAIL_PATTERN,
+  PHONE_PATTERN,
   AutoClockOutRun,
   BusinessHours,
   Employee,
   Fingerprint,
   Group,
-  Override,
+  FingerprintBypass,
   Punch,
   PunchCorrection,
   RuleRow,
@@ -122,10 +126,12 @@ def test_seed_rows(fresh_db: str):
   with psycopg.connect(fresh_db) as c:
     assert c.execute("SELECT id, name FROM groups").fetchall() == [(1, "default")]
     assert c.execute(
-      "SELECT auto_clock_out_enabled, auto_clock_out_run_time, auto_clock_out_stamp_time, subtract_lunch, subtract_breaks,"
-      " auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings"
-    ).fetchall() == [(True, time(23), time(23), True, False, "daily", True, True)]
+      "SELECT auto_clock_out_enabled, auto_clock_out_run_time, auto_clock_out_stamp_time, auto_clock_out_frequency,"
+      " lunches_enabled, breaks_enabled, paid_break_minutes, weekly_hours_alert FROM config.settings"
+    ).fetchall() == [(True, time(23), time(23), "daily", True, True, 30, Decimal(40))]
     assert c.execute("SELECT count(*) FROM config.business_hours").fetchone() == (0,)
+    with pytest.raises(errors.UndefinedColumn):  # the hours function replaces them (owner, 2026-10-27)
+      c.execute("SELECT subtract_lunch FROM config.settings")
 
 
 def test_employee_defaults_and_updated_at(fresh_db: str):
@@ -134,11 +140,11 @@ def test_employee_defaults_and_updated_at(fresh_db: str):
       c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12a', crypt('1234', gen_salt('bf')))")
     row = c.execute(
       "INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12', crypt('1234', gen_salt('bf')))"
-      " RETURNING id, group_id, role, active, updated_at"
+      " RETURNING id, group_id, role, active, fingerprint_exempt, phone, email, updated_at"
     ).fetchone()
     assert row is not None
-    employee_id, group_id, role, active, t0 = row
-    assert (group_id, role, active) == (1, "employee", True)
+    employee_id, group_id, role, active, exempt, phone, email, t0 = row
+    assert (group_id, role, active, exempt, phone, email) == (1, "employee", True, False, None, None)
     assert c.execute("SELECT crypt('1234', pin_hash) = pin_hash FROM employees WHERE id = %s", (employee_id,)).fetchone() == (True,)
     updated = c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s RETURNING updated_at", (employee_id,)).fetchone()
     assert updated is not None
@@ -164,7 +170,7 @@ def test_notify_payloads(fresh_db: str):
     employee_id = str(_add_employee(c))
     c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s", (employee_id,))
     c.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
-    c.execute("UPDATE config.settings SET subtract_breaks = true")
+    c.execute("UPDATE config.settings SET breaks_enabled = false")
     got = [
       (n.table, n.op, n.id)
       for n in (Notification.model_validate_json(raw.payload) for raw in listener.notifies(timeout=5, stop_after=4))
@@ -192,7 +198,7 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
     employee_id = _add_employee(admin)
     manager_id = _add_employee(admin, "Bob", "34")
   role = conninfo_to_dict(clock_login)["user"]
-  punch_id, override_id, fingerprint_id = uuid4(), uuid4(), uuid4()
+  punch_id, bypass_id, login_id, fingerprint_id = uuid4(), uuid4(), uuid4(), uuid4()
   with psycopg.connect(clock_login, autocommit=True) as c:
     for _ in range(2):
       c.execute(
@@ -200,9 +206,14 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
         (punch_id, employee_id, T),
       )
       c.execute(
-        "INSERT INTO overrides (id, punch_id, employee_id, manager_id, reason, pin_only, at, instance_id)"
-        " VALUES (%s, %s, %s, %s, 'no_fingerprint', false, %s, '1') ON CONFLICT (id) DO NOTHING",
-        (override_id, punch_id, employee_id, manager_id, T),
+        "INSERT INTO fingerprint_bypasses (id, punch_id, employee_id, manager_id, reason, pin_only, at, instance_id)"
+        " VALUES (%s, %s, %s, %s, 'override_no_fingerprint', false, %s, '1') ON CONFLICT (id) DO NOTHING",
+        (bypass_id, punch_id, employee_id, manager_id, T),
+      )
+      c.execute(
+        "INSERT INTO fingerprint_bypasses (id, employee_id, reason, at, instance_id)"
+        " VALUES (%s, %s, 'admin_pin_login', %s, '1') ON CONFLICT (id) DO NOTHING",
+        (login_id, manager_id, T),
       )
       c.execute(
         "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id)"
@@ -217,16 +228,21 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
       ("INSERT INTO punches (id, employee_id, kind, at, instance_id, automatic) VALUES (%s, %s, 'clock_in', %s, '1', true)", True),
       ("UPDATE punches SET at = now()", False),
       ("DELETE FROM punches", False),
-      ("SELECT * FROM overrides", False),
-      ("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Eve', '99', crypt('1234', gen_salt('bf')))", False),
-      ("UPDATE config.settings SET subtract_breaks = true", False),
+      ("SELECT * FROM fingerprint_bypasses", False),
+      (
+        "INSERT INTO employees (id, name, pin_username, pin_hash, fingerprint_exempt)"
+        " VALUES (10001, 'Eve', '10001', crypt('1234', gen_salt('bf')), true)",
+        False,
+      ),
+      ("UPDATE employees SET name = 'x'", False),
+      ("UPDATE config.settings SET breaks_enabled = false", False),
     ]
     for sql, takes_punch in forbidden:
       with pytest.raises(errors.InsufficientPrivilege):
         c.execute(sql, (uuid4(), employee_id, T) if takes_punch else None)  # pyright: ignore[reportArgumentType]
 
   with psycopg.connect(fresh_db) as admin:
-    assert admin.execute("SELECT count(*), min(db_login) FROM overrides").fetchone() == (1, role)
+    assert admin.execute("SELECT count(*), min(db_login) FROM fingerprint_bypasses").fetchone() == (2, role)
 
 
 def test_owner_can_update_and_delete_punches(fresh_db: str):
@@ -304,6 +320,124 @@ def test_pin_hash_check_survives_nonstandard_strings(admin_dsn: str):
       admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
+def test_employee_ids_are_by_default(fresh_db: str):
+  # A clock supplies the number it chose (§6.4); a hand-added row still takes the sequence.
+  insert = "INSERT INTO employees (id, name, pin_username, pin_hash) VALUES (%s, 'Ann', %s, crypt('1', gen_salt('bf')))"
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute(insert, (10001, "10001"))
+    assert _add_employee(c, "Bob", "34") == 1
+    with pytest.raises(errors.UniqueViolation):
+      c.execute(insert, (10001, "10002"))  # the number is taken
+    with pytest.raises(errors.UniqueViolation):
+      c.execute(insert, (10002, "34"))  # the username is taken
+
+
+@pytest.mark.parametrize(
+  ("column", "value", "ok"),
+  [
+    ("phone", "+15551234567", True),
+    ("phone", "5551234567", False),
+    ("phone", "+1555123456", False),
+    ("phone", "+1 555 123 4567", False),
+    ("email", "ann@example.com", True),
+    ("email", "a@b.co", True),
+    ("email", "a@b", False),
+    ("email", "ann example@b.co", False),
+    ("email", "@b.co", False),
+  ],
+)
+def test_contact_checks(fresh_db: str, column: str, value: str, *, ok: bool):
+  insert = sql.SQL("INSERT INTO employees (name, pin_username, pin_hash, {}) VALUES ('Ann', '12', crypt('1', gen_salt('bf')), %s)")
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    if ok:
+      c.execute(insert.format(sql.Identifier(column)), (value,))
+    else:
+      with pytest.raises(errors.CheckViolation):
+        c.execute(insert.format(sql.Identifier(column)), (value,))
+
+
+def _matches(pattern: str, sample: str) -> bool:
+  try:
+    TypeAdapter(Annotated[str, StringConstraints(pattern=pattern)]).validate_python(sample)
+  except ValidationError:
+    return False
+  return True
+
+
+def test_contact_patterns_match_the_models(fresh_db: str):
+  # The models and the SQL checks share one pattern; pydantic and PostgreSQL must read it alike.
+  samples = ["+15551234567", "+1555123456", "15551234567", "a@b.co", "a@b", "a b@c.d", "a@b@c.d", "a@.d", "x@y.z\n"]
+  with psycopg.connect(fresh_db) as c:
+    for pattern in (PHONE_PATTERN, EMAIL_PATTERN):
+      for sample in samples:
+        got = c.execute("SELECT %s ~ %s", (sample, pattern)).fetchone()
+        assert got == (_matches(pattern, sample),), (pattern, sample)
+
+
+def test_clock_login_adds_employees_and_managers_but_never_admins(fresh_db: str, clock_login: str):
+  insert = (
+    "INSERT INTO employees (id, name, pin_username, pin_hash, role, group_id, phone, email)"
+    " VALUES (%s, 'Ann', %s, crypt('1', gen_salt('bf')), %s, 1, '+15551234567', 'ann@example.com')"
+  )
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    c.execute(insert, (10001, "10001", "employee"))
+    c.execute(insert, (10002, "10002", "manager"))
+    with pytest.raises(errors.CheckViolation):
+      c.execute(insert, (10003, "10003", "admin"))
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute(insert, (10003, "10003", "admin"))  # the owner still can
+    rows = admin.execute("SELECT id, role, fingerprint_exempt, active FROM employees ORDER BY id").fetchall()
+  assert rows == [(10001, "employee", False, True), (10002, "manager", False, True), (10003, "admin", False, True)]
+
+
+@pytest.mark.parametrize(
+  ("columns", "ok"),
+  [
+    ("punch_id, manager_id, pin_only", True),  # an override
+    ("manager_id, pin_only", False),  # no punch
+    ("punch_id, pin_only", False),  # no manager
+    ("punch_id, manager_id", False),  # no pin_only
+  ],
+)
+def test_override_bypass_checks(fresh_db: str, columns: str, *, ok: bool):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id, manager_id = _add_employee(c), _add_employee(c, "Bob", "34")
+    values = {"punch_id": _add_punch(c, employee_id), "manager_id": manager_id, "pin_only": True}
+    names = columns.split(", ")
+    statement = sql.SQL(
+      "INSERT INTO fingerprint_bypasses (id, employee_id, reason, at, instance_id, {}) VALUES (%s, %s, 'override_no_fingerprint', %s, '1', {})"
+    ).format(sql.SQL(", ").join(map(sql.Identifier, names)), sql.SQL(", ").join(sql.Placeholder() * len(names)))
+    params = (uuid4(), employee_id, T, *(values[n] for n in names))
+    if ok:
+      c.execute(statement, params)
+    else:
+      with pytest.raises(errors.CheckViolation):
+        c.execute(statement, params)
+
+
+@pytest.mark.parametrize("reason", ["admin_pin_login", "exempt_pin_login"])
+def test_login_bypass_checks(fresh_db: str, reason: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id, manager_id = _add_employee(c), _add_employee(c, "Bob", "34")
+    insert = (
+      "INSERT INTO fingerprint_bypasses (id, employee_id, reason, at, instance_id, punch_id, manager_id, pin_only)"
+      " VALUES (%s, %s, %s, %s, '1', %s, %s, %s)"
+    )
+    c.execute(insert, (uuid4(), employee_id, reason, T, None, None, None))  # a login that punched nothing
+    c.execute(insert, (uuid4(), employee_id, reason, T, _add_punch(c, employee_id), None, None))  # a PIN rescan's punch
+    for manager, pin_only in [(manager_id, None), (None, True)]:
+      with pytest.raises(errors.CheckViolation):
+        c.execute(insert, (uuid4(), employee_id, reason, T, None, manager, pin_only))
+
+
+@pytest.mark.parametrize(
+  "statement", ["UPDATE config.settings SET paid_break_minutes = -1", "UPDATE config.settings SET weekly_hours_alert = 0"]
+)
+def test_hours_settings_checks(fresh_db: str, statement: LiteralString):
+  with psycopg.connect(fresh_db, autocommit=True) as c, pytest.raises(errors.CheckViolation):
+    c.execute(statement)
+
+
 def test_every_table_loads_into_its_model(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO groups (name) VALUES ('night')")
@@ -315,9 +449,13 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     )
     c.execute("INSERT INTO punch_corrections (punch_id, action, new_at) VALUES (%s, 'amend', %s)", (punch_id, T))
     c.execute(
-      "INSERT INTO overrides (id, punch_id, employee_id, manager_id, reason, pin_only, at, instance_id)"
-      " VALUES (%s, %s, %s, %s, 'fingerprint_skipped', true, %s, '1')",
+      "INSERT INTO fingerprint_bypasses (id, punch_id, employee_id, manager_id, reason, pin_only, at, instance_id)"
+      " VALUES (%s, %s, %s, %s, 'override_fingerprint_skipped', true, %s, '1')",
       (uuid4(), punch_id, employee_id, manager_id, T),
+    )
+    c.execute(
+      "INSERT INTO fingerprint_bypasses (id, employee_id, reason, at, instance_id) VALUES (%s, %s, 'exempt_pin_login', %s, '1')",
+      (uuid4(), employee_id, T),
     )
     c.execute("""INSERT INTO rules (kind, params, employee_id, on_violation) VALUES ('k', '{"n": 1}', %s, 'refuse')""", (employee_id,))
     c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
@@ -328,7 +466,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
       ("fingerprints", Fingerprint),
       ("punches", Punch),
       ("punch_corrections", PunchCorrection),
-      ("overrides", Override),
+      ("fingerprint_bypasses", FingerprintBypass),
       ("rules", RuleRow),
       ("config.business_hours", BusinessHours),
       ("config.settings", Settings),
@@ -342,7 +480,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     "fingerprints": 1,
     "punches": 1,
     "punch_corrections": 1,
-    "overrides": 1,
+    "fingerprint_bypasses": 2,
     "rules": 1,
     "config.business_hours": 1,
     "config.settings": 1,
@@ -423,7 +561,7 @@ def _days(start: date, run: time, stamp: time) -> list[tuple[datetime, datetime,
 
 def test_no_projection_until_the_backend_writes_a_zone(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
-    c.execute("UPDATE config.settings SET subtract_breaks = true")  # no zone: must not fail (the clocks' own test databases)
+    c.execute("UPDATE config.settings SET breaks_enabled = false")  # no zone: must not fail (the clocks' own test databases)
     assert _runs(c) == []
 
 
@@ -567,5 +705,5 @@ def test_unrelated_settings_edit_reprojects_identically(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (_noon_zone(),))
     before = _runs(c)
-    c.execute("UPDATE config.settings SET subtract_breaks = true")
+    c.execute("UPDATE config.settings SET breaks_enabled = false")
     assert _runs(c) == before

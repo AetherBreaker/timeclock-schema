@@ -1,6 +1,7 @@
 # Standard library imports
 import base64
 from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -10,12 +11,13 @@ from pydantic import ValidationError
 
 # First party imports
 from timeclock_schema.base import REVEAL
-from timeclock_schema.enums import AutoClockOutFrequency, CorrectionAction, EmployeeRole, PunchKind, RuleAction
+from timeclock_schema.enums import AutoClockOutFrequency, BypassReason, CorrectionAction, EmployeeRole, PunchKind, RuleAction
 from timeclock_schema.models import (
   AutoClockOutRun,
   BusinessHours,
   Employee,
   Fingerprint,
+  FingerprintBypass,
   Group,
   Punch,
   PunchCorrection,
@@ -97,15 +99,11 @@ def test_pin_hash_masked_unless_revealed():
 
 def test_settings_defaults_match_the_seed_row():
   s = Settings()
-  assert (s.auto_clock_out_enabled, s.auto_clock_out_run_time, s.auto_clock_out_stamp_time, s.subtract_lunch, s.subtract_breaks) == (
-    True,
-    time(23),
-    time(23),
-    True,
-    False,
-  )
+  assert (s.auto_clock_out_enabled, s.auto_clock_out_run_time, s.auto_clock_out_stamp_time) == (True, time(23), time(23))
   assert s.auto_clock_out_frequency is AutoClockOutFrequency.DAILY
   assert (s.lunches_enabled, s.breaks_enabled) == (True, True)
+  assert (s.paid_break_minutes, s.weekly_hours_alert) == (30, Decimal(40))
+  assert "subtract_lunch" not in Settings.model_fields
 
 
 def test_settings_new_columns_default_when_absent():
@@ -114,8 +112,7 @@ def test_settings_new_columns_default_when_absent():
     "auto_clock_out_enabled": True,
     "auto_clock_out_run_time": time(23),
     "auto_clock_out_stamp_time": time(23),
-    "subtract_lunch": False,
-    "subtract_breaks": False,
+    "subtract_lunch": False,  # dropped in 0.4.0; ignored like any unknown column
   }
   s = Settings.model_validate(old_row)
   assert (s.auto_clock_out_frequency, s.lunches_enabled, s.breaks_enabled) == (AutoClockOutFrequency.DAILY, True, True)
@@ -123,6 +120,11 @@ def test_settings_new_columns_default_when_absent():
   assert (s.auto_clock_out_frequency, s.lunches_enabled, s.breaks_enabled) == (AutoClockOutFrequency.DAILY, False, False)
   with pytest.raises(ValidationError):
     Settings.model_validate({"auto_clock_out_frequency": "weekly"})
+  assert Settings.model_validate(old_row).paid_break_minutes == 30
+  for bad in ({"paid_break_minutes": -1}, {"weekly_hours_alert": 0}, {"weekly_hours_alert": "40.125"}):
+    with pytest.raises(ValidationError):
+      Settings.model_validate(bad)
+  assert Settings.model_validate_json(Settings(weekly_hours_alert=Decimal("37.5")).model_dump_json()).weekly_hours_alert == Decimal("37.5")
 
 
 def test_employee_role():
@@ -157,3 +159,30 @@ def test_settings_accept_a_stamp_after_the_run_time():
 
 def test_unknown_columns_are_ignored():
   assert Group.model_validate({"id": 1, "name": "default", "added_later": 5}) == Group(id=1, name="default")
+
+
+def test_employee_contact_fields():
+  base = {"id": 10001, "name": "Ann", "pin_username": "10001", "pin_hash": "x", "updated_at": T}
+  e = Employee.model_validate(base)
+  assert (e.phone, e.email, e.fingerprint_exempt) == (None, None, False)
+  e = Employee.model_validate({**base, "phone": "+15551234567", "email": "ann@example.com", "fingerprint_exempt": True})
+  assert (e.phone, e.email, e.fingerprint_exempt) == ("+15551234567", "ann@example.com", True)
+  for bad in ({"phone": "555-123-4567"}, {"phone": "+15551234567\n"}, {"email": "ann@example"}, {"email": "a n@b.co"}):
+    with pytest.raises(ValidationError):
+      Employee.model_validate(base | bad)
+
+
+def test_bypass_reason_ties_the_optional_columns():
+  base = {"id": uuid4(), "employee_id": 1, "at": T, "instance_id": "1"}
+  override = {"punch_id": uuid4(), "manager_id": 2, "pin_only": False}
+  for reason in (BypassReason.OVERRIDE_NO_FINGERPRINT, BypassReason.OVERRIDE_FINGERPRINT_SKIPPED):
+    assert FingerprintBypass.model_validate(base | override | {"reason": reason}).reason.is_override
+    for missing in override:
+      with pytest.raises(ValidationError):
+        FingerprintBypass.model_validate(base | {k: v for k, v in override.items() if k != missing} | {"reason": reason})
+  for reason in (BypassReason.ADMIN_PIN_LOGIN, BypassReason.EXEMPT_PIN_LOGIN):
+    assert not FingerprintBypass.model_validate(base | {"reason": reason}).reason.is_override
+    FingerprintBypass.model_validate(base | {"reason": reason, "punch_id": uuid4()})  # a PIN rescan's punch
+    for extra in ({"manager_id": 2}, {"pin_only": True}):
+      with pytest.raises(ValidationError):
+        FingerprintBypass.model_validate(base | extra | {"reason": reason})

@@ -3,7 +3,8 @@
 # Standard library imports
 import base64
 from datetime import time
-from typing import Annotated, Any, Self
+from decimal import Decimal
+from typing import Annotated, Any, Final, Self
 from uuid import UUID
 
 # Third party imports
@@ -20,9 +21,14 @@ from pydantic import (
 
 # First party imports
 from timeclock_schema.base import LocalTime, TimeclockModel, UtcDatetime
-from timeclock_schema.enums import AutoClockOutFrequency, CorrectionAction, EmployeeRole, OverrideReason, PunchKind, RuleAction
+from timeclock_schema.enums import AutoClockOutFrequency, BypassReason, CorrectionAction, EmployeeRole, PunchKind, RuleAction
 
 _MASK = "**********"
+
+PHONE_PATTERN: Final = r"^[+]1[0-9]{10}$"
+"""A stored phone number: a US number as `+1` and ten digits (`employees.phone`'s check)."""
+EMAIL_PATTERN: Final = r"^[^@\s]+@[^@\s]+[.][^@\s]+$"
+"""A stored email: something, `@`, something, a dot, something (`employees.email`'s check)."""
 
 
 class Group(TimeclockModel):
@@ -42,6 +48,10 @@ class Employee(TimeclockModel):
   role: EmployeeRole = EmployeeRole.EMPLOYEE
   active: bool = True
   group_id: int = 1
+  phone: Annotated[str, StringConstraints(pattern=PHONE_PATTERN)] | None = None
+  email: Annotated[str, StringConstraints(pattern=EMAIL_PATTERN)] | None = None
+  fingerprint_exempt: bool = False
+  """Logs in by PIN alone: no fingerprint step and no override (§6.4)."""
   updated_at: UtcDatetime
 
   # JSON input needs no validator: SecretStr accepts the revealed string as is.
@@ -105,19 +115,31 @@ class PunchCorrection(TimeclockModel):
     return self
 
 
-class Override(TimeclockModel):
-  """`overrides` row: a manager's authorization of one punch (R23.5)."""
+class FingerprintBypass(TimeclockModel):
+  """`fingerprint_bypasses` row: a PIN login without a fingerprint (R23.5).
+
+  An override names its punch, its manager and whether the manager used a PIN alone; an admin's or exempt employee's
+  login names neither of the last two, and a punch only when its PIN authorized one (the table's check).
+  """
 
   id: UUID
-  punch_id: UUID
+  punch_id: UUID | None = None
   employee_id: int
-  manager_id: int
-  reason: OverrideReason
-  pin_only: bool
+  manager_id: int | None = None
+  reason: BypassReason
+  pin_only: bool | None = None
   at: UtcDatetime
   instance_id: str
   received_at: UtcDatetime | None = None
   db_login: str | None = None
+
+  @model_validator(mode="after")
+  def _check_reason(self) -> Self:
+    if self.reason.is_override and None in {self.punch_id, self.manager_id, self.pin_only}:
+      raise ValueError("an override names its punch, manager and pin_only")
+    if not self.reason.is_override and (self.manager_id is not None or self.pin_only is not None):
+      raise ValueError("a PIN login names no manager and no pin_only")
+    return self
 
 
 class RuleRow(TimeclockModel):
@@ -161,11 +183,13 @@ class Settings(TimeclockModel):
   auto_clock_out_run_time: LocalTime = time(23, 0)
   auto_clock_out_stamp_time: LocalTime = time(23, 0)
   auto_clock_out_frequency: AutoClockOutFrequency = AutoClockOutFrequency.DAILY
-  subtract_lunch: bool = True
-  subtract_breaks: bool = False
   lunches_enabled: bool = True
   breaks_enabled: bool = True
   """Business-wide switches for starting a lunch or a break (ending one is always offered); a per-group override may come later."""
+  paid_break_minutes: Annotated[int, Field(ge=0)] = 30
+  """Paid break time allowed per local day; break time beyond it is unpaid (§4.5)."""
+  weekly_hours_alert: Annotated[Decimal, Field(gt=0, max_digits=6, decimal_places=2)] = Decimal(40)
+  """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
 
 
 class AutoClockOutRun(TimeclockModel):
