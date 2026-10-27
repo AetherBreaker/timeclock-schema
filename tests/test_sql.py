@@ -381,7 +381,9 @@ def test_resolve_local_time(fresh_db: str, wall: str, zone: str, expected: datet
 
 def test_run_row_checks(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
-    insert = "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, %s)"
+    insert = (
+      "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, %s)"
+    )
     for stamp, ran_at, closed in [(T + timedelta(minutes=1), None, None), (T, T, None), (T, None, 0), (T, T, -1)]:
       with pytest.raises(errors.CheckViolation):
         c.execute(insert, (T, stamp, ran_at, closed))
@@ -390,15 +392,20 @@ def test_run_row_checks(fresh_db: str):
 
 def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login: str):
   with psycopg.connect(clock_login, autocommit=True) as c:
-    for statement in [
+    statements: list[LiteralString] = [
       "SELECT * FROM backend.auto_clock_out_runs",
       "SELECT * FROM backend.environment",
       "SELECT backend.resolve_local_time('2026-10-27 23:00', 'UTC')",
       "SELECT backend.project_auto_clock_out_runs()",
-    ]:
+    ]
+    for statement in statements:
       with pytest.raises(errors.InsufficientPrivilege):
         c.execute(statement)
-    assert c.execute("SELECT auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings").fetchone() == ("daily", True, True)
+    assert c.execute("SELECT auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings").fetchone() == (
+      "daily",
+      True,
+      True,
+    )
 
 
 def _noon_zone() -> str:
@@ -469,13 +476,15 @@ def test_reprojection_never_touches_a_run_row(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     _as_of_only(c)
     _project(c, "2026-10-27 22:00-04")
-    c.execute("UPDATE backend.auto_clock_out_runs SET ran_at = '2026-10-28 03:00:05Z', closed = 2 WHERE scheduled_for = '2026-10-28 03:00Z'")
+    c.execute(
+      "UPDATE backend.auto_clock_out_runs SET ran_at = '2026-10-28 03:00:05Z', closed = 2 WHERE scheduled_for = '2026-10-28 03:00Z'"
+    )
     ran = c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall()
     c.execute("UPDATE config.settings SET auto_clock_out_run_time = '22:30', auto_clock_out_stamp_time = '22:00'")
     _project(c, "2026-10-27 23:40-04")
     assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall() == ran
     rows = _runs(c)
-    assert rows[0] == (datetime(2026, 10, 27, 23), datetime(2026, 10, 27, 23), "America/New_York", True)
+    assert rows[0] == (datetime(2026, 10, 27, 23), datetime(2026, 10, 27, 23), "America/New_York", True)  # noqa: DTZ001 (local wall times)
     assert rows[1:] == _days(date(2026, 10, 28), time(22, 30), time(22))[:6]
 
 
@@ -563,7 +572,9 @@ def test_zone_change_reprojects_and_keeps_run_rows(fresh_db: str):
     ran = c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall()
     c.execute("UPDATE backend.environment SET tz = 'America/Chicago'")
     assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE ran_at IS NOT NULL").fetchall() == ran
-    unrun = c.execute("SELECT DISTINCT scheduled_tz, count(*) OVER () FROM backend.auto_clock_out_runs WHERE ran_at IS NULL").fetchall()
+    unrun = c.execute(
+      "SELECT DISTINCT scheduled_tz, count(*) OVER () FROM backend.auto_clock_out_runs WHERE ran_at IS NULL"
+    ).fetchall()
     assert unrun == [("America/Chicago", 7)]
 
 
