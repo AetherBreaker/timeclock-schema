@@ -1,7 +1,7 @@
 """Read-side shift rules (spec §4.5): the one implementation the clocks and the backend share, so payroll sees one answer."""
 
 # Standard library imports
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
   from zoneinfo import ZoneInfo
 
   # First party imports
-  from timeclock_schema.models import Punch, PunchCorrection
+  from timeclock_schema.models import Punch, PunchCorrection, Settings
 
 
 class EmployeeState(StrEnum):
@@ -138,11 +138,14 @@ def apply_corrections(punches: Iterable[Punch], corrections: Iterable[PunchCorre
   return sorted(effective, key=lambda e: (e.at, e.id))
 
 
-def build_timeline(punches: Iterable[Punch], corrections: Iterable[PunchCorrection] = ()) -> Timeline:
+def build_timeline(
+  punches: Iterable[Punch], corrections: Iterable[PunchCorrection] = (), *, as_of: datetime | None = None
+) -> Timeline:
   """Walk one employee's corrected punches through the state machine.
 
   A punch not valid from the current state is an anomaly, so of two consecutive same-type punches the oldest counts,
-  automatic or not (R41.2).
+  automatic or not (R41.2). With `as_of`, a punch whose effective time is later is left out: the clock passes now, since
+  the automatic clock-out may be stamped after it runs (§4.5), and a hand clock-out before that stamp then wins.
 
   Raises:
     ValueError: The punches belong to more than one employee.
@@ -150,7 +153,7 @@ def build_timeline(punches: Iterable[Punch], corrections: Iterable[PunchCorrecti
   punches = list(punches)
   if len({p.employee_id for p in punches}) > 1:
     raise ValueError("punches from more than one employee")
-  events = apply_corrections(punches, corrections)
+  events = [e for e in apply_corrections(punches, corrections) if as_of is None or e.at <= as_of]
   state = EmployeeState.OFF
   shifts: list[Shift] = []
   anomalies: list[Anomaly] = []
@@ -185,31 +188,70 @@ def build_timeline(punches: Iterable[Punch], corrections: Iterable[PunchCorrecti
   return Timeline(state=state, shifts=tuple(shifts), anomalies=tuple(anomalies), last_event_at=last_event_at)
 
 
-def worked_time(
-  timeline: Timeline, start: datetime, end: datetime, *, now: datetime, subtract_lunch: bool, subtract_breaks: bool
-) -> timedelta:
-  """Return the time worked inside `[start, end)`; an open shift, break or lunch runs until `now`.
+class HoursTotals(TimeclockModel):
+  """One employee's time in a range, as three separate totals (§4.5)."""
+
+  worked: timedelta
+  """Shift time less every lunch and break."""
+  paid_break: timedelta
+  """Break time within the daily allowance; not part of `worked`."""
+  unpaid: timedelta
+  """Lunch, plus break time over the allowance."""
+
+
+def total_hours(
+  punches: Iterable[Punch],
+  corrections: Iterable[PunchCorrection] = (),
+  *,
+  settings: Settings,
+  tz: ZoneInfo,
+  start: datetime,
+  end: datetime,
+  now: datetime,
+) -> HoursTotals:
+  """Total one employee's time inside `[start, end)`: every rule for counting hours lives here, and only here (§4.5).
+
+  - A punch whose effective time is after `now` doesn't count yet (the automatic clock-out may be written early, §8.4);
+    an open shift, break or lunch runs until `now`.
+  - Lunch is unpaid. Breaks are paid up to `settings.paid_break_minutes` per local calendar day in `tz`, each break
+    charged in full to the day it started, earliest first; the rest is unpaid.
+  - Each break is split where its day's allowance runs out, and the paid head and unpaid tail are then clipped to the
+    range: a range edge cuts a break's parts, never changes how much of it is paid. So pass every punch of any day the
+    range touches, or a day's earlier breaks go uncharged.
 
   Raises:
-    ValueError: `start`, `end` or `now` is naive.
+    ValueError: `start`, `end` or `now` is naive, or the punches belong to more than one employee.
   """
   if any(value.utcoffset() is None for value in (start, end, now)):
     raise ValueError("naive datetime; pass an aware one")
   start, end, now = start.astimezone(UTC), end.astimezone(UTC), now.astimezone(UTC)
-  total = timedelta()
-  for shift in timeline.shifts:
+  allowance = timedelta(minutes=settings.paid_break_minutes)
+  allowance_left: dict[date, timedelta] = {}
+  worked = paid_break = unpaid = timedelta()
+  for shift in build_timeline(punches, corrections, as_of=now).shifts:  # chronological, so breaks are charged in order
     lo = max(shift.clock_in.at, start)
     hi = min(now if shift.clock_out is None else shift.clock_out.at, end)
-    if hi <= lo:
-      continue
-    total += hi - lo
-    # Clip intervals to the shift's counted span, not just the window: a closed interval can end after `now` (clock skew,
-    # a future-dated amend), and subtracting beyond the span would under-count or go negative.
-    subtracted = (shift.lunches if subtract_lunch else ()) + (shift.breaks if subtract_breaks else ())
-    for interval in subtracted:
-      interval_end = now if interval.end is None else interval.end
-      total -= max(min(interval_end, hi) - max(interval.start, lo), timedelta())
-  return total
+
+    def counted(a: datetime, b: datetime, lo: datetime = lo, hi: datetime = hi) -> timedelta:
+      # The part of [a, b) inside both the range and the shift's counted span; nothing when the shift lies outside.
+      return max(min(b, hi) - max(a, lo), timedelta())
+
+    worked += counted(lo, hi)
+    for lunch in shift.lunches:
+      lunch_time = counted(lunch.start, now if lunch.end is None else lunch.end)
+      worked -= lunch_time
+      unpaid += lunch_time
+    # Charged even when the shift lies outside the range, so a later break that day sees the allowance already used.
+    for brk in shift.breaks:
+      brk_end = now if brk.end is None else brk.end
+      day = brk.start.astimezone(tz).date()
+      paid_length = min(allowance_left.get(day, allowance), brk_end - brk.start)
+      allowance_left[day] = allowance_left.get(day, allowance) - paid_length
+      paid_part, unpaid_part = counted(brk.start, brk.start + paid_length), counted(brk.start + paid_length, brk_end)
+      worked -= paid_part + unpaid_part
+      paid_break += paid_part
+      unpaid += unpaid_part
+  return HoursTotals(worked=worked, paid_break=paid_break, unpaid=unpaid)
 
 
 def week_bounds(at: datetime, tz: ZoneInfo) -> tuple[datetime, datetime]:

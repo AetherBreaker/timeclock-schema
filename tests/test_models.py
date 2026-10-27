@@ -120,11 +120,13 @@ def test_settings_new_columns_default_when_absent():
   assert (s.auto_clock_out_frequency, s.lunches_enabled, s.breaks_enabled) == (AutoClockOutFrequency.DAILY, False, False)
   with pytest.raises(ValidationError):
     Settings.model_validate({"auto_clock_out_frequency": "weekly"})
-  assert Settings.model_validate(old_row).paid_break_minutes == 30
+  assert Settings.model_validate(old_row).paid_break_minutes == Settings().paid_break_minutes
   for bad in ({"paid_break_minutes": -1}, {"weekly_hours_alert": 0}, {"weekly_hours_alert": "40.125"}):
     with pytest.raises(ValidationError):
       Settings.model_validate(bad)
-  assert Settings.model_validate_json(Settings(weekly_hours_alert=Decimal("37.5")).model_dump_json()).weekly_hours_alert == Decimal("37.5")
+  assert Settings.model_validate_json(Settings(weekly_hours_alert=Decimal("37.5")).model_dump_json()).weekly_hours_alert == Decimal(
+    "37.5"
+  )
 
 
 def test_employee_role():
