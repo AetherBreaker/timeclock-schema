@@ -1,6 +1,8 @@
 -- timeclock-schema 0001: the tables, view and triggers of design §4, and the role `timeclock_clock_access` (created
 -- only if absent, since roles are server-wide) with its grants. Plain SQL: runs unchanged in `timeclock` and
 -- `timeclock_test` (R26.6). The backend's runner owns `schema_migrations`, the group roles and the `CONNECT` grants (§8.3).
+-- Revised in place before any deployment (2026-10-27: employee roles, the lunch/break switches, the automatic clock-out's
+-- run record), since no real database had applied it. Once one exists, every change is a new migration.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- crypt()/gen_salt('bf') for PIN hashes (R23.1)
 
@@ -8,6 +10,8 @@ CREATE TYPE punch_kind AS ENUM ('clock_in', 'clock_out', 'break_start', 'break_e
 CREATE TYPE correction_action AS ENUM ('void', 'amend');
 CREATE TYPE override_reason AS ENUM ('no_fingerprint', 'fingerprint_skipped');
 CREATE TYPE rule_action AS ENUM ('refuse', 'warn', 'accept');
+CREATE TYPE employee_role AS ENUM ('employee', 'manager', 'admin');  -- lowest to highest: an admin may do all a manager may
+CREATE TYPE auto_clock_out_frequency AS ENUM ('daily');  -- later values: ALTER TYPE ... ADD VALUE
 
 CREATE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -28,7 +32,7 @@ CREATE TABLE employees (
   -- Only a bcrypt hash (R23.1): the owner types rows by hand, and a plain PIN must never be stored. Checked here, not in
   -- the model, since a failing validator would echo the PIN in its error.
   pin_hash     text NOT NULL CHECK (pin_hash ~ '^[$]2[abxy][$][0-9]{2}[$][./A-Za-z0-9]{53}$'),
-  is_manager   boolean NOT NULL DEFAULT false,
+  role         employee_role NOT NULL DEFAULT 'employee',
   active       boolean NOT NULL DEFAULT true,
   group_id     bigint NOT NULL DEFAULT 1 REFERENCES groups (id),
   updated_at   timestamptz NOT NULL DEFAULT now()
@@ -121,6 +125,11 @@ CREATE TABLE config.settings (
   auto_clock_out_stamp_time time NOT NULL DEFAULT '23:00:00',
   subtract_lunch            boolean NOT NULL DEFAULT true,
   subtract_breaks           boolean NOT NULL DEFAULT false,
+  auto_clock_out_frequency  auto_clock_out_frequency NOT NULL DEFAULT 'daily',
+  -- Business-wide switches for starting a lunch or a break (the clock always offers ending one); a per-group override may
+  -- later take precedence.
+  lunches_enabled           boolean NOT NULL DEFAULT true,
+  breaks_enabled            boolean NOT NULL DEFAULT true,
   CHECK (auto_clock_out_run_time < '24:00' AND auto_clock_out_stamp_time < '24:00')
 );
 INSERT INTO config.settings DEFAULT VALUES;
@@ -164,6 +173,65 @@ CREATE TRIGGER punch_corrections_notify AFTER INSERT OR UPDATE OR DELETE ON punc
 CREATE TRIGGER rules_notify AFTER INSERT OR UPDATE OR DELETE ON rules FOR EACH ROW EXECUTE FUNCTION notify_change();
 CREATE TRIGGER business_hours_notify AFTER INSERT OR UPDATE OR DELETE ON config.business_hours FOR EACH ROW EXECUTE FUNCTION notify_change();
 CREATE TRIGGER settings_notify AFTER INSERT OR UPDATE OR DELETE ON config.settings FOR EACH ROW EXECUTE FUNCTION notify_change();
+
+-- The automatic clock-out's run record (owner's design, 2026-10-27). One row per scheduled run, projected 7 days ahead in
+-- the backend's zone; a `config.settings` edit or a change of that zone reprojects in the same transaction, and the
+-- backend's every pass extends it as the days pass. A row that has run, or whose time has passed, is history and never
+-- changes. Schema `backend` has no grant to `timeclock_clock_access` (R26.2).
+CREATE SCHEMA backend;
+
+-- The backend's `TZ`, written at every start; nothing is projected before the first.
+CREATE TABLE backend.environment (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  tz text    NOT NULL
+);
+
+-- scheduled_for and stamp are instants resolved from wall times in scheduled_tz. ran_at (when the run committed) and closed
+-- (its clock-out count) are set together, in the run's own transaction.
+CREATE TABLE backend.auto_clock_out_runs (
+  id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  scheduled_for timestamptz NOT NULL,
+  scheduled_tz  text NOT NULL,
+  stamp         timestamptz NOT NULL,
+  ran_at        timestamptz,
+  closed        integer CHECK (closed >= 0),
+  CHECK (stamp <= scheduled_for),
+  CHECK ((ran_at IS NULL) = (closed IS NULL))
+);
+CREATE INDEX auto_clock_out_runs_scheduled_for ON backend.auto_clock_out_runs (scheduled_for);
+
+-- `wall` in `run_zone` as an instant, by the owner's DST rule: a skipped wall time resolves to the gap's end (02:30 in a
+-- 02:00-03:00 gap runs at 03:00), a repeated one to its first occurrence. `AT TIME ZONE` alone does the opposite of both
+-- (skipped 02:30 -> 03:30, repeated -> the second). Independent of the session's TimeZone: hours, not days, are added to
+-- timestamptz values.
+CREATE FUNCTION backend.resolve_local_time(wall timestamp, run_zone text) RETURNS timestamptz LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  -- `wall` under the UTC offset in force a day earlier and a day later; no zone changes offset twice within two days.
+  earlier timestamptz := ((wall - interval '1 day') AT TIME ZONE run_zone) + interval '24 hours';
+  later   timestamptz := ((wall + interval '1 day') AT TIME ZONE run_zone) - interval '24 hours';
+  lo      bigint;
+  hi      bigint;
+  mid     bigint;
+BEGIN
+  IF (earlier AT TIME ZONE run_zone) = wall THEN
+    RETURN earlier;  -- an ordinary time, or a repeated one's first occurrence (the earlier offset is the larger one)
+  ELSIF (later AT TIME ZONE run_zone) = wall THEN
+    RETURN later;
+  END IF;
+  -- Skipped: the gap ends at the first instant whose wall time reaches `wall`. `later` reads before the gap, `earlier` after
+  -- it; bisect the whole seconds between (transitions fall on whole seconds).
+  lo := extract(epoch FROM later);
+  hi := extract(epoch FROM earlier);
+  WHILE hi - lo > 1 LOOP
+    mid := (lo + hi) / 2;
+    IF (to_timestamp(mid) AT TIME ZONE run_zone) >= wall THEN
+      hi := mid;
+    ELSE
+      lo := mid;
+    END IF;
+  END LOOP;
+  RETURN to_timestamp(hi);
+END $$;
 
 -- What every clock login may do (R26.2), through the backend's group roles (§4.4, §8.3).
 DO $$
