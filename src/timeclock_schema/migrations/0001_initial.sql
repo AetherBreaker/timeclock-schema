@@ -195,7 +195,6 @@ CREATE TABLE backend.auto_clock_out_runs (
   stamp         timestamptz NOT NULL,
   ran_at        timestamptz,
   closed        integer CHECK (closed >= 0),
-  CHECK (stamp <= scheduled_for),
   CHECK ((ran_at IS NULL) = (closed IS NULL))
 );
 CREATE INDEX auto_clock_out_runs_scheduled_for ON backend.auto_clock_out_runs (scheduled_for);
@@ -203,35 +202,31 @@ CREATE INDEX auto_clock_out_runs_scheduled_for ON backend.auto_clock_out_runs (s
 -- Prunes every unrun row later than `as_of` and projects the next 7 days in the backend's zone (`as_of` exists for tests;
 -- callers pass nothing). `daily`, the only frequency: one row a local day from today to today + 6. A day already holding a
 -- row (run, or missed and awaiting the backend's catch-up with its own stamp) gets none; today's row is projected even when
--- its time has passed, and the backend runs it at once. Nothing is projected without a settings row or a zone, while
--- disabled, or for a stamp time later than the run time (the backend alerts on that, R41.3). The advisory lock serializes
--- projections (an owner's edit, the backend's pass) so two can't both fill one day; runs don't take it.
+-- its time has passed, and the backend runs it at once. Nothing is projected without a settings row or a zone, or while
+-- disabled. The stamp is that day's stamp time, and may be later than the run time (owner, 2026-10-27). The advisory
+-- lock serializes projections (an owner's edit, the backend's pass) so two can't both fill one day; runs don't take it.
 -- DST is Postgres's own `AT TIME ZONE` (owner, 2026-10-27): a skipped wall time moves forward by the gap (02:30 -> 03:30),
--- a repeated one resolves to its second occurrence; neither depends on the session's TimeZone. A stamp skipped past its
--- run time (stamp 02:30, run 03:00 on spring-forward day) is capped at the run time: a clock-out is never in its run's future.
+-- a repeated one resolves to its second occurrence; neither depends on the session's TimeZone.
 CREATE FUNCTION backend.project_auto_clock_out_runs(as_of timestamptz DEFAULT now()) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   s        config.settings%ROWTYPE;
   run_zone text;
   today    date;
   d        date;
-  run_at   timestamptz;
 BEGIN
   PERFORM pg_advisory_xact_lock(7461726503);
   DELETE FROM backend.auto_clock_out_runs WHERE ran_at IS NULL AND scheduled_for > as_of;
   SELECT * INTO s FROM config.settings;
   SELECT tz INTO run_zone FROM backend.environment;
-  IF s.id IS NULL OR run_zone IS NULL OR NOT s.auto_clock_out_enabled
-     OR s.auto_clock_out_stamp_time > s.auto_clock_out_run_time THEN
+  IF s.id IS NULL OR run_zone IS NULL OR NOT s.auto_clock_out_enabled THEN
     RETURN;
   END IF;
   today := (as_of AT TIME ZONE run_zone)::date;
   FOR i IN 0..6 LOOP
     d := today + i;
     IF NOT EXISTS (SELECT FROM backend.auto_clock_out_runs r WHERE (r.scheduled_for AT TIME ZONE r.scheduled_tz)::date = d) THEN
-      run_at := (d + s.auto_clock_out_run_time) AT TIME ZONE run_zone;
       INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp)
-      VALUES (run_at, run_zone, LEAST((d + s.auto_clock_out_stamp_time) AT TIME ZONE run_zone, run_at));
+      VALUES ((d + s.auto_clock_out_run_time) AT TIME ZONE run_zone, run_zone, (d + s.auto_clock_out_stamp_time) AT TIME ZONE run_zone);
     END IF;
   END LOOP;
 END $$;

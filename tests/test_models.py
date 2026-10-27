@@ -149,12 +149,10 @@ def test_auto_clock_out_run_row():
   assert run.scheduled_for.tzinfo is UTC
 
 
-def test_auto_clock_out_rejects_stamp_after_run():
-  assert Settings(auto_clock_out_run_time=time(23), auto_clock_out_stamp_time=time(18)).auto_clock_out().stamp_time == time(18)
-  assert Settings(auto_clock_out_run_time=time(23), auto_clock_out_stamp_time=time(23)).auto_clock_out().stamp_time == time(23)
-  bad = Settings(auto_clock_out_run_time=time(2), auto_clock_out_stamp_time=time(23))  # the row itself still loads
-  with pytest.raises(ValidationError):
-    bad.auto_clock_out()
+def test_settings_accept_a_stamp_after_the_run_time():
+  # No stamp <= run rule (owner, 2026-10-27, superseding R41.3).
+  s = Settings(auto_clock_out_run_time=time(2), auto_clock_out_stamp_time=time(23))
+  assert (s.auto_clock_out_run_time, s.auto_clock_out_stamp_time) == (time(2), time(23))
 
 
 def test_unknown_columns_are_ignored():

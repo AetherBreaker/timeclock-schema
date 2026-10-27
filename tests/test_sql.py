@@ -358,10 +358,11 @@ def test_run_row_checks(fresh_db: str):
     insert = (
       "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, %s)"
     )
-    for stamp, ran_at, closed in [(T + timedelta(minutes=1), None, None), (T, T, None), (T, None, 0), (T, T, -1)]:
+    for ran_at, closed in [(T, None), (None, 0), (T, -1)]:
       with pytest.raises(errors.CheckViolation):
-        c.execute(insert, (T, stamp, ran_at, closed))
+        c.execute(insert, (T, T, ran_at, closed))
     c.execute(insert, (T, T, None, None))
+    c.execute(insert, (T, T + timedelta(hours=1), None, None))  # a stamp after the run is allowed (owner, 2026-10-27)
 
 
 def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login: str):
@@ -496,12 +497,12 @@ def test_dst_weeks_use_postgres_resolution(fresh_db: str):
       (datetime(2026, 3, 9, 6, 30, tzinfo=UTC), datetime(2026, 3, 9, 6, 15, tzinfo=UTC)),
     ]
     c.execute("DELETE FROM backend.auto_clock_out_runs")
-    # Only the stamp is skipped, and it moves past the run time: capped at the run time, not a CHECK failure.
+    # Only the stamp is skipped, and it moves past the run time: stored as resolved (03:30 EDT, after the 03:00 run).
     c.execute("UPDATE config.settings SET auto_clock_out_run_time = '03:00', auto_clock_out_stamp_time = '02:30'")
     _project(c, "2026-03-06 12:00-05")
     assert c.execute(
       "SELECT scheduled_for, stamp FROM backend.auto_clock_out_runs WHERE (scheduled_for AT TIME ZONE scheduled_tz)::date = '2026-03-08'"
-    ).fetchall() == [(datetime(2026, 3, 8, 7, 0, tzinfo=UTC), datetime(2026, 3, 8, 7, 0, tzinfo=UTC))]
+    ).fetchall() == [(datetime(2026, 3, 8, 7, 0, tzinfo=UTC), datetime(2026, 3, 8, 7, 30, tzinfo=UTC))]
     c.execute("DELETE FROM backend.auto_clock_out_runs")
     c.execute("UPDATE config.settings SET auto_clock_out_run_time = '01:30', auto_clock_out_stamp_time = '01:00'")
     _project(c, "2026-10-30 12:00-04")
@@ -529,18 +530,20 @@ def test_disabling_prunes_the_future_and_keeps_history(fresh_db: str):
     assert c.execute("SELECT * FROM backend.auto_clock_out_runs WHERE scheduled_for < now() ORDER BY id").fetchall() == history
 
 
-@pytest.mark.parametrize(
-  "statement",
-  [
-    "UPDATE config.settings SET auto_clock_out_run_time = '22:00', auto_clock_out_stamp_time = '23:00'",  # invalid (R41.3)
-    "DELETE FROM config.settings",
-  ],
-)
-def test_settings_that_cannot_project_prune_and_project_nothing(fresh_db: str, statement: LiteralString):
+def test_deleted_settings_prune_and_project_nothing(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO backend.environment (tz) VALUES (%s)", (_noon_zone(),))
-    c.execute(statement)
+    c.execute("DELETE FROM config.settings")
     assert _runs(c) == []
+
+
+def test_stamp_after_the_run_time_is_projected_as_given(fresh_db: str):
+  # No stamp <= run rule (owner, 2026-10-27, superseding R41.3): each day's stamp is that day's stamp time.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    _as_of_only(c)
+    c.execute("UPDATE config.settings SET auto_clock_out_run_time = '22:00', auto_clock_out_stamp_time = '23:00'")
+    _project(c, "2026-10-27 12:00-04")
+    assert _runs(c) == _days(date(2026, 10, 27), time(22), time(23))
 
 
 def test_zone_change_reprojects_and_keeps_run_rows(fresh_db: str):

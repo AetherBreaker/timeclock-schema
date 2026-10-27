@@ -154,25 +154,8 @@ class BusinessHours(TimeclockModel):
     return self
 
 
-class AutoClockOut(TimeclockModel):
-  """The automatic clock-out's run and stamp times, checked against each other (R41.3)."""
-
-  run_time: LocalTime
-  stamp_time: LocalTime
-
-  @model_validator(mode="after")
-  def _check_stamp_not_after_run(self) -> Self:
-    if self.stamp_time > self.run_time:
-      raise ValueError("auto_clock_out_stamp_time is later than auto_clock_out_run_time")
-    return self
-
-
 class Settings(TimeclockModel):
-  """The one `config.settings` row; its `id` column is ignored.
-
-  The two auto-clock-out times aren't checked here, so a clock can still read the subtraction switches from a badly edited
-  row; the backend checks them through `auto_clock_out()` (R41.3).
-  """
+  """The one `config.settings` row; its `id` column is ignored."""
 
   auto_clock_out_enabled: bool = True
   auto_clock_out_run_time: LocalTime = time(23, 0)
@@ -183,14 +166,6 @@ class Settings(TimeclockModel):
   lunches_enabled: bool = True
   breaks_enabled: bool = True
   """Business-wide switches for starting a lunch or a break (ending one is always offered); a per-group override may come later."""
-
-  def auto_clock_out(self) -> AutoClockOut:
-    """Return the checked auto-clock-out times.
-
-    Raises:
-      ValidationError: The stamp time is later than the run time.
-    """
-    return AutoClockOut(run_time=self.auto_clock_out_run_time, stamp_time=self.auto_clock_out_stamp_time)
 
 
 class AutoClockOutRun(TimeclockModel):
