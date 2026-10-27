@@ -12,7 +12,7 @@ skipped. Each test gets its own freshly migrated database, dropped afterwards.
 # Standard library imports
 import os
 from contextlib import contextmanager
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from typing import TYPE_CHECKING, LiteralString, cast, get_args
 from uuid import uuid4
 
@@ -26,6 +26,7 @@ from psycopg.rows import dict_row
 # First party imports
 from timeclock_schema.migrations import load_migrations
 from timeclock_schema.models import (
+  AutoClockOutRun,
   BusinessHours,
   Employee,
   Fingerprint,
@@ -121,9 +122,9 @@ def test_seed_rows(fresh_db: str):
   with psycopg.connect(fresh_db) as c:
     assert c.execute("SELECT id, name FROM groups").fetchall() == [(1, "default")]
     assert c.execute(
-      "SELECT auto_clock_out_enabled, auto_clock_out_run_time, auto_clock_out_stamp_time, subtract_lunch, subtract_breaks"
-      " FROM config.settings"
-    ).fetchall() == [(True, time(23), time(23), True, False)]
+      "SELECT auto_clock_out_enabled, auto_clock_out_run_time, auto_clock_out_stamp_time, subtract_lunch, subtract_breaks,"
+      " auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings"
+    ).fetchall() == [(True, time(23), time(23), True, False, "daily", True, True)]
     assert c.execute("SELECT count(*) FROM config.business_hours").fetchone() == (0,)
 
 
@@ -133,15 +134,28 @@ def test_employee_defaults_and_updated_at(fresh_db: str):
       c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12a', crypt('1234', gen_salt('bf')))")
     row = c.execute(
       "INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12', crypt('1234', gen_salt('bf')))"
-      " RETURNING id, group_id, is_manager, active, updated_at"
+      " RETURNING id, group_id, role, active, updated_at"
     ).fetchone()
     assert row is not None
-    employee_id, group_id, is_manager, active, t0 = row
-    assert (group_id, is_manager, active) == (1, False, True)
+    employee_id, group_id, role, active, t0 = row
+    assert (group_id, role, active) == (1, "employee", True)
     assert c.execute("SELECT crypt('1234', pin_hash) = pin_hash FROM employees WHERE id = %s", (employee_id,)).fetchone() == (True,)
     updated = c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s RETURNING updated_at", (employee_id,)).fetchone()
     assert updated is not None
     assert updated[0] > t0
+
+
+def test_employee_role_values(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id = _add_employee(c)
+    for role in ("manager", "admin", "employee"):
+      c.execute("UPDATE employees SET role = %s WHERE id = %s", (role, employee_id))
+    with pytest.raises(errors.InvalidTextRepresentation):
+      c.execute("UPDATE employees SET role = 'owner' WHERE id = %s", (employee_id,))
+    with pytest.raises(errors.UndefinedColumn):
+      c.execute("SELECT is_manager FROM employees")
+    # Declared lowest to highest, so SQL can ask "manager or above" with `role >= 'manager'`.
+    assert c.execute("SELECT enum_range(NULL::employee_role)::text").fetchone() == ("{employee,manager,admin}",)
 
 
 def test_notify_payloads(fresh_db: str):
@@ -307,6 +321,11 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     )
     c.execute("""INSERT INTO rules (kind, params, employee_id, on_violation) VALUES ('k', '{"n": 1}', %s, 'refuse')""", (employee_id,))
     c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
+    c.execute("INSERT INTO backend.environment (tz) VALUES ('UTC')")
+    c.execute(
+      "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, 2)",
+      (T, T, T),
+    )
     tables: list[tuple[LiteralString, type[TimeclockModel]]] = [
       ("groups", Group),
       ("employees", Employee),
@@ -317,6 +336,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
       ("rules", RuleRow),
       ("config.business_hours", BusinessHours),
       ("config.settings", Settings),
+      ("backend.auto_clock_out_runs", AutoClockOutRun),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -330,7 +350,55 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     "rules": 1,
     "config.business_hours": 1,
     "config.settings": 1,
+    "backend.auto_clock_out_runs": 1,
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
   assert loaded["fingerprints"][0].model_dump()["template"].get_secret_value() == b"tmpl"
+
+
+@pytest.mark.parametrize(
+  ("wall", "zone", "expected"),
+  [
+    ("2026-10-27 23:00", "America/New_York", datetime(2026, 10, 28, 3, 0, tzinfo=UTC)),  # an ordinary day
+    ("2026-03-08 02:30", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),  # skipped: runs at 03:00 EDT
+    ("2026-03-08 02:00", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
+    ("2026-03-08 02:59:59", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
+    ("2026-03-08 01:59:59", "America/New_York", datetime(2026, 3, 8, 6, 59, 59, tzinfo=UTC)),
+    ("2026-03-08 03:00", "America/New_York", datetime(2026, 3, 8, 7, 0, tzinfo=UTC)),
+    ("2026-03-08 23:00", "America/New_York", datetime(2026, 3, 9, 3, 0, tzinfo=UTC)),
+    ("2026-11-01 01:30", "America/New_York", datetime(2026, 11, 1, 5, 30, tzinfo=UTC)),  # repeated: the first (EDT)
+    ("2026-11-01 01:00", "America/New_York", datetime(2026, 11, 1, 5, 0, tzinfo=UTC)),
+    ("2026-11-01 00:59", "America/New_York", datetime(2026, 11, 1, 4, 59, tzinfo=UTC)),
+    ("2026-11-01 02:00", "America/New_York", datetime(2026, 11, 1, 7, 0, tzinfo=UTC)),
+    ("2026-11-01 23:00", "America/New_York", datetime(2026, 11, 2, 4, 0, tzinfo=UTC)),
+    ("2026-10-04 02:15", "Australia/Lord_Howe", datetime(2026, 10, 3, 15, 30, tzinfo=UTC)),  # a 30-minute gap
+    ("2026-04-05 01:45", "Australia/Lord_Howe", datetime(2026, 4, 4, 14, 45, tzinfo=UTC)),
+    ("2026-10-27 23:00", "UTC", datetime(2026, 10, 27, 23, 0, tzinfo=UTC)),
+  ],
+)
+def test_resolve_local_time(fresh_db: str, wall: str, zone: str, expected: datetime):
+  with psycopg.connect(fresh_db) as c:
+    c.execute("SET TIME ZONE 'Asia/Tokyo'")  # the session's zone must not matter
+    assert c.execute("SELECT backend.resolve_local_time(%s::timestamp, %s)", (wall, zone)).fetchone() == (expected,)
+
+
+def test_run_row_checks(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    insert = "INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp, ran_at, closed) VALUES (%s, 'UTC', %s, %s, %s)"
+    for stamp, ran_at, closed in [(T + timedelta(minutes=1), None, None), (T, T, None), (T, None, 0), (T, T, -1)]:
+      with pytest.raises(errors.CheckViolation):
+        c.execute(insert, (T, stamp, ran_at, closed))
+    c.execute(insert, (T, T, None, None))
+
+
+def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login: str):
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    for statement in [
+      "SELECT * FROM backend.auto_clock_out_runs",
+      "SELECT * FROM backend.environment",
+      "SELECT backend.resolve_local_time('2026-10-27 23:00', 'UTC')",
+    ]:
+      with pytest.raises(errors.InsufficientPrivilege):
+        c.execute(statement)
+    assert c.execute("SELECT auto_clock_out_frequency, lunches_enabled, breaks_enabled FROM config.settings").fetchone() == ("daily", True, True)
