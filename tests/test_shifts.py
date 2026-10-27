@@ -8,15 +8,16 @@ import pytest
 
 # First party imports
 from timeclock_schema.enums import CorrectionAction, PunchKind
-from timeclock_schema.models import Punch, PunchCorrection
+from timeclock_schema.models import Punch, PunchCorrection, Settings
 from timeclock_schema.shifts import (
   VALID_NEXT,
   EmployeeState,
+  HoursTotals,
   Interval,
   auto_clock_out_due,
   build_timeline,
+  total_hours,
   week_bounds,
-  worked_time,
 )
 
 CLOCK_IN, CLOCK_OUT = PunchKind.CLOCK_IN, PunchKind.CLOCK_OUT
@@ -27,6 +28,7 @@ T = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)  # Tuesday 08:00 EDT
 H = timedelta(hours=1)
 M = timedelta(minutes=1)
 NY = ZoneInfo("America/New_York")
+S = Settings()  # a 30-minute daily paid break allowance
 
 
 def punch(kind: PunchKind, at: datetime, *, automatic: bool = False, punch_id: UUID | None = None, employee_id: int = 1) -> Punch:
@@ -88,11 +90,12 @@ def test_invalid_punches_are_anomalies():
 def test_automatic_clock_out_stands_against_a_later_real_one():
   monday = T - 24 * H  # Monday 08:00 EDT
   auto_out, real_out = punch(CLOCK_OUT, monday + 15 * H, automatic=True), punch(CLOCK_OUT, T)
-  tl = build_timeline([punch(CLOCK_IN, monday), auto_out, real_out])
+  punches = [punch(CLOCK_IN, monday), auto_out, real_out]
+  tl = build_timeline(punches)
   assert len(tl.shifts) == 1 and tl.state is EmployeeState.OFF
   clock_out = tl.shifts[0].clock_out
   assert clock_out is not None and clock_out.id == auto_out.id
-  assert worked_time(tl, monday, T + H, now=T + H, subtract_lunch=True, subtract_breaks=True) == 15 * H
+  assert total_hours(punches, settings=S, tz=NY, start=monday, end=T + H, now=T + H).worked == 15 * H
   assert [(a.punch.id, a.state) for a in tl.anomalies] == [(real_out.id, EmployeeState.OFF)]
 
 
@@ -163,59 +166,126 @@ def test_mixed_employees_rejected():
     build_timeline([punch(CLOCK_IN, T, employee_id=1), punch(CLOCK_OUT, T + H, employee_id=2)])
 
 
-def test_worked_time_lunch_and_break_switches():
-  tl = build_timeline(
-    [
-      punch(CLOCK_IN, T),
-      punch(BREAK_START, T + 2 * H),
-      punch(BREAK_END, T + 2 * H + 15 * M),
-      punch(LUNCH_START, T + 4 * H),
-      punch(LUNCH_END, T + 4 * H + 30 * M),
-      punch(CLOCK_OUT, T + 8 * H),
-    ]
+def hours(
+  punches: list[Punch], *, now: datetime, settings: Settings = S, corrections: tuple[PunchCorrection, ...] = ()
+) -> HoursTotals:
+  """Totals over the week containing T."""
+  start, end = week_bounds(T, NY)
+  return total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
+
+
+def test_hours_split_worked_paid_break_and_unpaid():
+  day = [
+    punch(CLOCK_IN, T),
+    punch(BREAK_START, T + 2 * H),
+    punch(BREAK_END, T + 2 * H + 15 * M),
+    punch(LUNCH_START, T + 4 * H),
+    punch(LUNCH_END, T + 4 * H + 30 * M),
+    punch(CLOCK_OUT, T + 8 * H),
+  ]
+  assert hours(day, now=T + 9 * H) == HoursTotals(worked=7 * H + 15 * M, paid_break=15 * M, unpaid=30 * M)
+
+
+def test_break_time_over_the_daily_allowance_is_unpaid():
+  two_breaks = [
+    punch(CLOCK_IN, T),
+    punch(BREAK_START, T + H),
+    punch(BREAK_END, T + H + 20 * M),
+    punch(BREAK_START, T + 3 * H),
+    punch(BREAK_END, T + 3 * H + 20 * M),
+    punch(CLOCK_OUT, T + 8 * H),
+  ]
+  assert hours(two_breaks, now=T + 9 * H) == HoursTotals(worked=8 * H - 40 * M, paid_break=30 * M, unpaid=10 * M)
+  one_long = [punch(CLOCK_IN, T), punch(BREAK_START, T + H), punch(BREAK_END, T + H + 45 * M), punch(CLOCK_OUT, T + 8 * H)]
+  assert hours(one_long, now=T + 9 * H) == HoursTotals(worked=8 * H - 45 * M, paid_break=30 * M, unpaid=15 * M)
+  no_allowance = Settings(paid_break_minutes=0)
+  assert hours(one_long, now=T + 9 * H, settings=no_allowance) == HoursTotals(
+    worked=8 * H - 45 * M, paid_break=timedelta(), unpaid=45 * M
   )
-  week = week_bounds(T, NY)
-  assert worked_time(tl, *week, now=T + 9 * H, subtract_lunch=True, subtract_breaks=False) == 7 * H + 30 * M
-  assert worked_time(tl, *week, now=T + 9 * H, subtract_lunch=True, subtract_breaks=True) == 7 * H + 15 * M
-  assert worked_time(tl, *week, now=T + 9 * H, subtract_lunch=False, subtract_breaks=False) == 8 * H
 
 
-def test_worked_time_open_shift_counts_until_now():
-  week = week_bounds(T, NY)
-  assert worked_time(build_timeline([punch(CLOCK_IN, T)]), *week, now=T + 3 * H, subtract_lunch=True, subtract_breaks=False) == 3 * H
-  on_break = build_timeline([punch(CLOCK_IN, T), punch(BREAK_START, T + H)])
-  assert worked_time(on_break, *week, now=T + 2 * H, subtract_lunch=True, subtract_breaks=True) == H
+def test_a_break_counts_toward_the_day_it_started():
+  # Tuesday 20:00 to Wednesday 02:00 local. The first break starts Tuesday and runs past midnight on Tuesday's allowance;
+  # the second, after midnight, has Wednesday's. Were the first charged to Wednesday, the second would be unpaid.
+  evening = datetime(2026, 10, 27, 20, 0, tzinfo=NY)
+  night = [
+    punch(CLOCK_IN, evening),
+    punch(BREAK_START, evening + 3 * H + 50 * M),  # 23:50
+    punch(BREAK_END, evening + 4 * H + 20 * M),  # 00:20
+    punch(BREAK_START, evening + 5 * H),
+    punch(BREAK_END, evening + 5 * H + 30 * M),
+    punch(CLOCK_OUT, evening + 6 * H),
+  ]
+  assert hours(night, now=evening + 7 * H) == HoursTotals(worked=5 * H, paid_break=H, unpaid=timedelta())
 
 
-def test_worked_time_now_before_closed_lunch_ends():
-  tl = build_timeline([punch(CLOCK_IN, T), punch(LUNCH_START, T + H), punch(LUNCH_END, T + 2 * H)])
-  week = week_bounds(T, NY)
-  assert worked_time(tl, *week, now=T - H, subtract_lunch=True, subtract_breaks=False) == timedelta()
-  assert worked_time(tl, *week, now=T + H + 30 * M, subtract_lunch=True, subtract_breaks=False) == H
-  assert worked_time(tl, *week, now=T + 3 * H, subtract_lunch=True, subtract_breaks=False) == 2 * H
+def test_each_local_day_gets_its_own_allowance():
+  def day(at: datetime) -> list[Punch]:
+    return [punch(CLOCK_IN, at), punch(BREAK_START, at + H), punch(BREAK_END, at + H + 30 * M), punch(CLOCK_OUT, at + 4 * H)]
+
+  assert hours(day(T) + day(T + 24 * H), now=T + 30 * H) == HoursTotals(worked=7 * H, paid_break=H, unpaid=timedelta())
 
 
-def test_worked_time_splits_at_week_boundary():
+def test_a_range_edge_clips_a_break_without_reallocating_it():
+  # One hour of break from T: its first 30 minutes are paid and the rest unpaid, wherever the range starts.
+  shift = [punch(CLOCK_IN, T - H), punch(BREAK_START, T), punch(BREAK_END, T + H), punch(CLOCK_OUT, T + 2 * H)]
+  got = total_hours(shift, settings=S, tz=NY, start=T + 45 * M, end=T + 3 * H, now=T + 3 * H)
+  assert got == HoursTotals(worked=H, paid_break=timedelta(), unpaid=15 * M)
+
+
+def test_open_shift_and_open_break_run_until_now():
+  assert hours([punch(CLOCK_IN, T)], now=T + 3 * H) == HoursTotals(worked=3 * H, paid_break=timedelta(), unpaid=timedelta())
+  on_break = [punch(CLOCK_IN, T), punch(BREAK_START, T + H)]
+  assert hours(on_break, now=T + 2 * H) == HoursTotals(worked=H, paid_break=30 * M, unpaid=30 * M)
+
+
+def test_punches_stamped_after_now_dont_count_yet():
+  # The automatic clock-out may be written before its stamp (§8.4); until then the shift is open and runs until now.
+  with_future_out = [punch(CLOCK_IN, T), punch(CLOCK_OUT, T + 10 * H, automatic=True)]
+  assert hours(with_future_out, now=T + 5 * H).worked == 5 * H
+  assert hours(with_future_out, now=T + 12 * H).worked == 10 * H
+  lunch = [punch(CLOCK_IN, T), punch(LUNCH_START, T + H), punch(LUNCH_END, T + 2 * H)]
+  assert hours(lunch, now=T - H) == HoursTotals(worked=timedelta(), paid_break=timedelta(), unpaid=timedelta())
+  assert hours(lunch, now=T + H + 30 * M) == HoursTotals(worked=H, paid_break=timedelta(), unpaid=30 * M)
+  assert hours(lunch, now=T + 3 * H) == HoursTotals(worked=2 * H, paid_break=timedelta(), unpaid=H)
+
+
+def test_corrections_apply_before_totalling():
+  out = punch(CLOCK_OUT, T + 8 * H)
+  amend = PunchCorrection(id=uuid4(), punch_id=out.id, action=CorrectionAction.AMEND, new_at=T + 6 * H, recorded_at=T + 9 * H)
+  assert hours([punch(CLOCK_IN, T), out], now=T + 9 * H, corrections=(amend,)).worked == 6 * H
+
+
+def test_build_timeline_as_of_drops_later_punches():
+  later = punch(CLOCK_OUT, T + 10 * H, automatic=True)
+  assert build_timeline([punch(CLOCK_IN, T), later], as_of=T + 5 * H).state is EmployeeState.WORKING
+  assert build_timeline([punch(CLOCK_IN, T), later], as_of=T + 10 * H).state is EmployeeState.OFF
+  # The effective time counts: a correction moving a punch past `as_of` drops it too.
+  moved = PunchCorrection(id=uuid4(), punch_id=later.id, action=CorrectionAction.AMEND, new_at=T + 11 * H, recorded_at=T)
+  assert build_timeline([punch(CLOCK_IN, T), later], [moved], as_of=T + 10 * H).state is EmployeeState.WORKING
+
+
+def test_hours_split_at_the_week_boundary():
   sunday_night = datetime(2026, 11, 8, 22, 0, tzinfo=NY)  # 2026-11-09 03:00 UTC
-  tl = build_timeline([punch(CLOCK_IN, sunday_night), punch(CLOCK_OUT, sunday_night + 4 * H)])
+  shift = [
+    punch(CLOCK_IN, sunday_night),
+    punch(LUNCH_START, sunday_night + 90 * M),  # 23:30, half an hour before the boundary
+    punch(LUNCH_END, sunday_night + 150 * M),  # 00:30
+    punch(CLOCK_OUT, sunday_night + 4 * H),
+  ]
   this_week, next_week = week_bounds(sunday_night, NY), week_bounds(sunday_night + 4 * H, NY)
   assert this_week[1] == datetime(2026, 11, 9, 5, 0, tzinfo=UTC) == next_week[0]
   for bounds in (this_week, next_week):
-    assert worked_time(tl, *bounds, now=sunday_night + 5 * H, subtract_lunch=True, subtract_breaks=False) == 2 * H
+    got = total_hours(shift, settings=S, tz=NY, start=bounds[0], end=bounds[1], now=sunday_night + 5 * H)
+    assert got == HoursTotals(worked=90 * M, paid_break=timedelta(), unpaid=30 * M)
 
 
-def test_worked_time_clips_lunch_straddling_the_week_boundary():
-  sunday_night = datetime(2026, 11, 8, 22, 0, tzinfo=NY)
-  tl = build_timeline(
-    [
-      punch(CLOCK_IN, sunday_night),
-      punch(LUNCH_START, sunday_night + 90 * M),  # 23:30, half an hour before the boundary
-      punch(LUNCH_END, sunday_night + 150 * M),  # 00:30
-      punch(CLOCK_OUT, sunday_night + 4 * H),
-    ]
-  )
-  for bounds in (week_bounds(sunday_night, NY), week_bounds(sunday_night + 4 * H, NY)):
-    assert worked_time(tl, *bounds, now=sunday_night + 5 * H, subtract_lunch=True, subtract_breaks=False) == 90 * M
+@pytest.mark.parametrize("field", ["start", "end", "now"])
+def test_hours_reject_naive_datetimes(field: str):
+  start, end = week_bounds(T, NY)
+  args = {"start": start, "end": end, "now": T} | {field: datetime(2026, 10, 27, 15)}  # noqa: DTZ001
+  with pytest.raises(ValueError, match="naive"):
+    total_hours([punch(CLOCK_IN, T)], settings=S, tz=NY, start=args["start"], end=args["end"], now=args["now"])
 
 
 def test_week_bounds_across_dst():
@@ -228,17 +298,6 @@ def test_week_bounds_across_dst():
 def test_week_bounds_at_monday_midnight():
   monday = datetime(2026, 11, 9, 0, 0, tzinfo=NY)
   assert week_bounds(monday, NY)[0] == monday.astimezone(UTC)
-
-
-def test_worked_time_rejects_naive_now():
-  with pytest.raises(ValueError, match="naive"):
-    worked_time(
-      build_timeline([punch(CLOCK_IN, T)]),
-      *week_bounds(T, NY),
-      now=datetime(2026, 10, 27, 15),  # noqa: DTZ001
-      subtract_lunch=True,
-      subtract_breaks=False,
-    )
 
 
 def test_auto_clock_out_due():

@@ -34,8 +34,8 @@ from timeclock_schema.models import (
   BusinessHours,
   Employee,
   Fingerprint,
-  Group,
   FingerprintBypass,
+  Group,
   Punch,
   PunchCorrection,
   RuleRow,
@@ -230,8 +230,10 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
       ("DELETE FROM punches", False),
       ("SELECT * FROM fingerprint_bypasses", False),
       (
-        "INSERT INTO employees (id, name, pin_username, pin_hash, fingerprint_exempt)"
-        " VALUES (10001, 'Eve', '10001', crypt('1234', gen_salt('bf')), true)",
+        (
+          "INSERT INTO employees (id, name, pin_username, pin_hash, fingerprint_exempt)"
+          " VALUES (10001, 'Eve', '10001', crypt('1234', gen_salt('bf')), true)"
+        ),
         False,
       ),
       ("UPDATE employees SET name = 'x'", False),
