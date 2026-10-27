@@ -22,11 +22,21 @@ class CorrectionAction(StrEnum):
   AMEND = "amend"
 
 
-class OverrideReason(StrEnum):
-  """`override_reason`."""
+class BypassReason(StrEnum):
+  """`bypass_reason`: why a PIN login went without a fingerprint (spec §4.2)."""
 
-  NO_FINGERPRINT = "no_fingerprint"
-  FINGERPRINT_SKIPPED = "fingerprint_skipped"
+  OVERRIDE_NO_FINGERPRINT = "override_no_fingerprint"
+  """A manager override for an employee with no registered print."""
+  OVERRIDE_FINGERPRINT_SKIPPED = "override_fingerprint_skipped"
+  """A manager override for an employee who has a print but didn't scan it."""
+  ADMIN_PIN_LOGIN = "admin_pin_login"
+  EXEMPT_PIN_LOGIN = "exempt_pin_login"
+  """A `fingerprint_exempt` employee's PIN login."""
+
+  @property
+  def is_override(self) -> bool:
+    """Whether a manager approved it, so the row names the manager and the punch."""
+    return self in {BypassReason.OVERRIDE_NO_FINGERPRINT, BypassReason.OVERRIDE_FINGERPRINT_SKIPPED}
 
 
 class RuleAction(StrEnum):
