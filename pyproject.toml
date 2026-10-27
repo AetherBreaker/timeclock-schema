@@ -1,6 +1,6 @@
 [project]
   name            = "timeclock-schema"
-  version         = "0.3.1"
+  version         = "0.4.0"
   description     = "Shared models, shift logic and SQL migrations for timeclock-system and timeclock-backend"
   readme          = "README.md"
   requires-python = ">=3.14"
