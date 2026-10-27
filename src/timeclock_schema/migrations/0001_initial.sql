@@ -233,6 +233,51 @@ BEGIN
   RETURN to_timestamp(hi);
 END $$;
 
+-- Prunes every unrun row later than `as_of` and projects the next 7 days in the backend's zone (`as_of` exists for tests;
+-- callers pass nothing). `daily`, the only frequency: one row a local day from today to today + 6. A day already holding a
+-- row (run, or missed and awaiting the backend's catch-up with its own stamp) gets none; today's row is projected even when
+-- its time has passed, and the backend runs it at once. Nothing is projected without a settings row or a zone, while
+-- disabled, or for a stamp time later than the run time (the backend alerts on that, R41.3). The advisory lock serializes
+-- projections (an owner's edit, the backend's pass) so two can't both fill one day; runs don't take it.
+CREATE FUNCTION backend.project_auto_clock_out_runs(as_of timestamptz DEFAULT now()) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  s        config.settings%ROWTYPE;
+  run_zone text;
+  today    date;
+  d        date;
+BEGIN
+  PERFORM pg_advisory_xact_lock(7461726503);
+  DELETE FROM backend.auto_clock_out_runs WHERE ran_at IS NULL AND scheduled_for > as_of;
+  SELECT * INTO s FROM config.settings;
+  SELECT tz INTO run_zone FROM backend.environment;
+  IF s.id IS NULL OR run_zone IS NULL OR NOT s.auto_clock_out_enabled
+     OR s.auto_clock_out_stamp_time > s.auto_clock_out_run_time THEN
+    RETURN;
+  END IF;
+  today := (as_of AT TIME ZONE run_zone)::date;
+  FOR i IN 0..6 LOOP
+    d := today + i;
+    IF NOT EXISTS (SELECT FROM backend.auto_clock_out_runs r WHERE (r.scheduled_for AT TIME ZONE r.scheduled_tz)::date = d) THEN
+      INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp)
+      VALUES (backend.resolve_local_time(d + s.auto_clock_out_run_time, run_zone), run_zone,
+              backend.resolve_local_time(d + s.auto_clock_out_stamp_time, run_zone));
+    END IF;
+  END LOOP;
+END $$;
+
+CREATE FUNCTION backend.reproject_auto_clock_out_runs() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM backend.project_auto_clock_out_runs();
+  RETURN NULL;
+END $$;
+
+-- Any settings change reprojects; an edit to an unrelated column reprojects identically. The backend upserts its zone
+-- with a WHERE that updates nothing when it's unchanged, so only a new or changed zone fires the second trigger.
+CREATE TRIGGER settings_reproject_auto_clock_out AFTER INSERT OR UPDATE OR DELETE ON config.settings
+  FOR EACH ROW EXECUTE FUNCTION backend.reproject_auto_clock_out_runs();
+CREATE TRIGGER environment_reproject_auto_clock_out AFTER INSERT OR UPDATE ON backend.environment
+  FOR EACH ROW EXECUTE FUNCTION backend.reproject_auto_clock_out_runs();
+
 -- What every clock login may do (R26.2), through the backend's group roles (§4.4, §8.3).
 DO $$
 BEGIN
