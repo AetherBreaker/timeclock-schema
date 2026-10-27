@@ -200,51 +200,22 @@ CREATE TABLE backend.auto_clock_out_runs (
 );
 CREATE INDEX auto_clock_out_runs_scheduled_for ON backend.auto_clock_out_runs (scheduled_for);
 
--- `wall` in `run_zone` as an instant, by the owner's DST rule: a skipped wall time resolves to the gap's end (02:30 in a
--- 02:00-03:00 gap runs at 03:00), a repeated one to its first occurrence. `AT TIME ZONE` alone does the opposite of both
--- (skipped 02:30 -> 03:30, repeated -> the second). Independent of the session's TimeZone: hours, not days, are added to
--- timestamptz values.
-CREATE FUNCTION backend.resolve_local_time(wall timestamp, run_zone text) RETURNS timestamptz LANGUAGE plpgsql STABLE AS $$
-DECLARE
-  -- `wall` under the UTC offset in force a day earlier and a day later; no zone changes offset twice within two days.
-  earlier timestamptz := ((wall - interval '1 day') AT TIME ZONE run_zone) + interval '24 hours';
-  later   timestamptz := ((wall + interval '1 day') AT TIME ZONE run_zone) - interval '24 hours';
-  lo      bigint;
-  hi      bigint;
-  mid     bigint;
-BEGIN
-  IF (earlier AT TIME ZONE run_zone) = wall THEN
-    RETURN earlier;  -- an ordinary time, or a repeated one's first occurrence (the earlier offset is the larger one)
-  ELSIF (later AT TIME ZONE run_zone) = wall THEN
-    RETURN later;
-  END IF;
-  -- Skipped: the gap ends at the first instant whose wall time reaches `wall`. `later` reads before the gap, `earlier` after
-  -- it; bisect the whole seconds between (transitions fall on whole seconds).
-  lo := extract(epoch FROM later);
-  hi := extract(epoch FROM earlier);
-  WHILE hi - lo > 1 LOOP
-    mid := (lo + hi) / 2;
-    IF (to_timestamp(mid) AT TIME ZONE run_zone) >= wall THEN
-      hi := mid;
-    ELSE
-      lo := mid;
-    END IF;
-  END LOOP;
-  RETURN to_timestamp(hi);
-END $$;
-
 -- Prunes every unrun row later than `as_of` and projects the next 7 days in the backend's zone (`as_of` exists for tests;
 -- callers pass nothing). `daily`, the only frequency: one row a local day from today to today + 6. A day already holding a
 -- row (run, or missed and awaiting the backend's catch-up with its own stamp) gets none; today's row is projected even when
 -- its time has passed, and the backend runs it at once. Nothing is projected without a settings row or a zone, while
 -- disabled, or for a stamp time later than the run time (the backend alerts on that, R41.3). The advisory lock serializes
 -- projections (an owner's edit, the backend's pass) so two can't both fill one day; runs don't take it.
+-- DST is Postgres's own `AT TIME ZONE` (owner, 2026-10-27): a skipped wall time moves forward by the gap (02:30 -> 03:30),
+-- a repeated one resolves to its second occurrence; neither depends on the session's TimeZone. A stamp skipped past its
+-- run time (stamp 02:30, run 03:00 on spring-forward day) is capped at the run time: a clock-out is never in its run's future.
 CREATE FUNCTION backend.project_auto_clock_out_runs(as_of timestamptz DEFAULT now()) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   s        config.settings%ROWTYPE;
   run_zone text;
   today    date;
   d        date;
+  run_at   timestamptz;
 BEGIN
   PERFORM pg_advisory_xact_lock(7461726503);
   DELETE FROM backend.auto_clock_out_runs WHERE ran_at IS NULL AND scheduled_for > as_of;
@@ -258,9 +229,9 @@ BEGIN
   FOR i IN 0..6 LOOP
     d := today + i;
     IF NOT EXISTS (SELECT FROM backend.auto_clock_out_runs r WHERE (r.scheduled_for AT TIME ZONE r.scheduled_tz)::date = d) THEN
+      run_at := (d + s.auto_clock_out_run_time) AT TIME ZONE run_zone;
       INSERT INTO backend.auto_clock_out_runs (scheduled_for, scheduled_tz, stamp)
-      VALUES (backend.resolve_local_time(d + s.auto_clock_out_run_time, run_zone), run_zone,
-              backend.resolve_local_time(d + s.auto_clock_out_stamp_time, run_zone));
+      VALUES (run_at, run_zone, LEAST((d + s.auto_clock_out_stamp_time) AT TIME ZONE run_zone, run_at));
     END IF;
   END LOOP;
 END $$;
