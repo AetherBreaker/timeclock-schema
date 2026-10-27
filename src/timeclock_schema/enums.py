@@ -35,3 +35,17 @@ class RuleAction(StrEnum):
   REFUSE = "refuse"
   WARN = "warn"
   ACCEPT = "accept"
+
+
+class EmployeeRole(StrEnum):
+  """`employee_role`, lowest to highest: an admin may do everything a manager may (approve overrides, R23.6)."""
+
+  EMPLOYEE = "employee"
+  MANAGER = "manager"
+  ADMIN = "admin"
+
+
+class AutoClockOutFrequency(StrEnum):
+  """`auto_clock_out_frequency`: how often the automatic clock-out runs; daily only for now."""
+
+  DAILY = "daily"

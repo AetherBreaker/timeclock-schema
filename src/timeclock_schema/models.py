@@ -20,7 +20,7 @@ from pydantic import (
 
 # First party imports
 from timeclock_schema.base import LocalTime, TimeclockModel, UtcDatetime
-from timeclock_schema.enums import CorrectionAction, OverrideReason, PunchKind, RuleAction
+from timeclock_schema.enums import AutoClockOutFrequency, CorrectionAction, EmployeeRole, OverrideReason, PunchKind, RuleAction
 
 _MASK = "**********"
 
@@ -39,7 +39,7 @@ class Employee(TimeclockModel):
   name: str
   pin_username: Annotated[str, StringConstraints(pattern=r"^[0-9]+$")]
   pin_hash: SecretStr
-  is_manager: bool = False
+  role: EmployeeRole = EmployeeRole.EMPLOYEE
   active: bool = True
   group_id: int = 1
   updated_at: UtcDatetime
@@ -177,8 +177,12 @@ class Settings(TimeclockModel):
   auto_clock_out_enabled: bool = True
   auto_clock_out_run_time: LocalTime = time(23, 0)
   auto_clock_out_stamp_time: LocalTime = time(23, 0)
+  auto_clock_out_frequency: AutoClockOutFrequency = AutoClockOutFrequency.DAILY
   subtract_lunch: bool = True
   subtract_breaks: bool = False
+  lunches_enabled: bool = True
+  breaks_enabled: bool = True
+  """Business-wide switches for starting a lunch or a break (ending one is always offered); a per-group override may come later."""
 
   def auto_clock_out(self) -> AutoClockOut:
     """Return the checked auto-clock-out times.
@@ -187,3 +191,14 @@ class Settings(TimeclockModel):
       ValidationError: The stamp time is later than the run time.
     """
     return AutoClockOut(run_time=self.auto_clock_out_run_time, stamp_time=self.auto_clock_out_stamp_time)
+
+
+class AutoClockOutRun(TimeclockModel):
+  """`backend.auto_clock_out_runs` row: one scheduled automatic clock-out; `ran_at` and `closed` stay None until it runs."""
+
+  id: int
+  scheduled_for: UtcDatetime
+  scheduled_tz: str
+  stamp: UtcDatetime
+  ran_at: UtcDatetime | None = None
+  closed: int | None = None

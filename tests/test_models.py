@@ -10,8 +10,18 @@ from pydantic import ValidationError
 
 # First party imports
 from timeclock_schema.base import REVEAL
-from timeclock_schema.enums import CorrectionAction, PunchKind, RuleAction
-from timeclock_schema.models import BusinessHours, Employee, Fingerprint, Group, Punch, PunchCorrection, RuleRow, Settings
+from timeclock_schema.enums import AutoClockOutFrequency, CorrectionAction, EmployeeRole, PunchKind, RuleAction
+from timeclock_schema.models import (
+  AutoClockOutRun,
+  BusinessHours,
+  Employee,
+  Fingerprint,
+  Group,
+  Punch,
+  PunchCorrection,
+  RuleRow,
+  Settings,
+)
 
 T = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
 
@@ -94,6 +104,49 @@ def test_settings_defaults_match_the_seed_row():
     True,
     False,
   )
+  assert s.auto_clock_out_frequency is AutoClockOutFrequency.DAILY
+  assert (s.lunches_enabled, s.breaks_enabled) == (True, True)
+
+
+def test_settings_new_columns_default_when_absent():
+  # A clock's SELECT names its own columns (0.2.0's five), so 0.3.0's columns can be absent from a row it loads.
+  old_row = {
+    "auto_clock_out_enabled": True,
+    "auto_clock_out_run_time": time(23),
+    "auto_clock_out_stamp_time": time(23),
+    "subtract_lunch": False,
+    "subtract_breaks": False,
+  }
+  s = Settings.model_validate(old_row)
+  assert (s.auto_clock_out_frequency, s.lunches_enabled, s.breaks_enabled) == (AutoClockOutFrequency.DAILY, True, True)
+  s = Settings.model_validate({**old_row, "auto_clock_out_frequency": "daily", "lunches_enabled": False, "breaks_enabled": False})
+  assert (s.auto_clock_out_frequency, s.lunches_enabled, s.breaks_enabled) == (AutoClockOutFrequency.DAILY, False, False)
+  with pytest.raises(ValidationError):
+    Settings.model_validate({"auto_clock_out_frequency": "weekly"})
+
+
+def test_employee_role():
+  base = {"id": 1, "name": "Ann", "pin_username": "12", "pin_hash": "x", "updated_at": datetime(2026, 10, 27, tzinfo=UTC)}
+  assert Employee.model_validate(base).role is EmployeeRole.EMPLOYEE
+  assert Employee.model_validate({**base, "role": "admin"}).role is EmployeeRole.ADMIN
+  # A pre-0.3.0 payload's is_manager is ignored (extra="ignore"): it no longer grants anything.
+  assert Employee.model_validate({**base, "is_manager": True}).role is EmployeeRole.EMPLOYEE
+  assert "is_manager" not in Employee.model_fields
+  with pytest.raises(ValidationError):
+    Employee.model_validate({**base, "role": "owner"})
+
+
+def test_auto_clock_out_run_row():
+  ny = ZoneInfo("America/New_York")
+  run = AutoClockOutRun(
+    id=1,
+    scheduled_for=datetime(2026, 10, 27, 23, 0, tzinfo=ny),
+    scheduled_tz="America/New_York",
+    stamp=datetime(2026, 10, 27, 22, 0, tzinfo=ny),
+  )
+  assert (run.ran_at, run.closed) == (None, None)
+  assert run.scheduled_for == datetime(2026, 10, 28, 3, 0, tzinfo=UTC)
+  assert run.scheduled_for.tzinfo is UTC
 
 
 def test_auto_clock_out_rejects_stamp_after_run():
