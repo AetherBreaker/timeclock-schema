@@ -99,10 +99,11 @@ def clock_login(admin_dsn: str, fresh_db: str) -> Iterator[str]:
       admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
-def _add_employee(c: psycopg.Connection, name: str = "Ann", pin_username: str = "12") -> int:
+def _add_employee(c: psycopg.Connection, first_name: str = "Ann", pin_username: str = "12") -> int:
   row = c.execute(
-    "INSERT INTO employees (name, pin_username, pin_hash) VALUES (%s, %s, crypt('1234', gen_salt('bf'))) RETURNING id",
-    (name, pin_username),
+    "INSERT INTO employees (first_name, last_name, pin_username, pin_hash)"
+    " VALUES (%s, 'Lee', %s, crypt('1234', gen_salt('bf'))) RETURNING id",
+    (first_name, pin_username),
   ).fetchone()
   assert row is not None
   return row[0]
@@ -137,16 +138,18 @@ def test_seed_rows(fresh_db: str):
 def test_employee_defaults_and_updated_at(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     with pytest.raises(errors.CheckViolation):
-      c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12a', crypt('1234', gen_salt('bf')))")
+      c.execute(
+        "INSERT INTO employees (first_name, last_name, pin_username, pin_hash) VALUES ('Ann', 'Lee', '12a', crypt('1234', gen_salt('bf')))"
+      )
     row = c.execute(
-      "INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Ann', '12', crypt('1234', gen_salt('bf')))"
+      "INSERT INTO employees (first_name, last_name, pin_username, pin_hash) VALUES ('Ann', 'Lee', '12', crypt('1234', gen_salt('bf')))"
       " RETURNING id, group_id, role, active, fingerprint_exempt, phone, email, updated_at"
     ).fetchone()
     assert row is not None
     employee_id, group_id, role, active, exempt, phone, email, t0 = row
     assert (group_id, role, active, exempt, phone, email) == (1, "employee", True, False, None, None)
     assert c.execute("SELECT crypt('1234', pin_hash) = pin_hash FROM employees WHERE id = %s", (employee_id,)).fetchone() == (True,)
-    updated = c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s RETURNING updated_at", (employee_id,)).fetchone()
+    updated = c.execute("UPDATE employees SET first_name = 'Annie' WHERE id = %s RETURNING updated_at", (employee_id,)).fetchone()
     assert updated is not None
     assert updated[0] > t0
 
@@ -168,7 +171,7 @@ def test_notify_payloads(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as listener, psycopg.connect(fresh_db, autocommit=True) as c:
     listener.execute(f"LISTEN {NOTIFY_CHANNEL}")
     employee_id = str(_add_employee(c))
-    c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s", (employee_id,))
+    c.execute("UPDATE employees SET first_name = 'Annie' WHERE id = %s", (employee_id,))
     c.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
     c.execute("UPDATE config.settings SET breaks_enabled = false")
     got = [
@@ -231,12 +234,12 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
       ("SELECT * FROM fingerprint_bypasses", False),
       (
         (
-          "INSERT INTO employees (id, name, pin_username, pin_hash, fingerprint_exempt)"
-          " VALUES (10001, 'Eve', '10001', crypt('1234', gen_salt('bf')), true)"
+          "INSERT INTO employees (id, first_name, last_name, pin_username, pin_hash, fingerprint_exempt)"
+          " VALUES (10001, 'Eve', 'Lee', '10001', crypt('1234', gen_salt('bf')), true)"
         ),
         False,
       ),
-      ("UPDATE employees SET name = 'x'", False),
+      ("UPDATE employees SET first_name = 'x'", False),
       ("UPDATE config.settings SET breaks_enabled = false", False),
     ]
     for sql, takes_punch in forbidden:
@@ -272,9 +275,9 @@ def test_punch_log_shows_current_name_and_latest_correction(fresh_db: str):
       "INSERT INTO punch_corrections (punch_id, action, recorded_at) VALUES (%s, 'void', now() - interval '1 hour')", (punch_id,)
     )
     c.execute("INSERT INTO punch_corrections (punch_id, action, new_kind) VALUES (%s, 'amend', 'clock_out')", (punch_id,))
-    c.execute("UPDATE employees SET name = 'Ann B' WHERE id = %s", (employee_id,))
+    c.execute("UPDATE employees SET middle_name = 'B' WHERE id = %s", (employee_id,))
     row = c.execute("SELECT employee_name, correction, db_login FROM punch_log WHERE id = %s", (punch_id,)).fetchone()
-  assert row == ("Ann B", "amend", "postgres")
+  assert row == ("Ann B Lee", "amend", "postgres")
 
 
 @pytest.mark.parametrize(
@@ -300,7 +303,7 @@ def test_pin_hash_must_be_bcrypt(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     _add_employee(c)  # crypt('1234', gen_salt('bf'))
     with pytest.raises(errors.CheckViolation):
-      c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
+      c.execute("INSERT INTO employees (first_name, last_name, pin_username, pin_hash) VALUES ('Bob', 'Lee', '34', '1234')")
 
 
 def test_pin_hash_check_survives_nonstandard_strings(admin_dsn: str):
@@ -316,7 +319,7 @@ def test_pin_hash_check_survives_nonstandard_strings(admin_dsn: str):
           c.execute(cast("LiteralString", m.sql))  # package data, not user input
       _add_employee(c)  # crypt('1234', gen_salt('bf'))
       with pytest.raises(errors.CheckViolation):
-        c.execute("INSERT INTO employees (name, pin_username, pin_hash) VALUES ('Bob', '34', '1234')")
+        c.execute("INSERT INTO employees (first_name, last_name, pin_username, pin_hash) VALUES ('Bob', 'Lee', '34', '1234')")
   finally:
     with psycopg.connect(admin_dsn, autocommit=True) as admin:
       admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
@@ -324,7 +327,7 @@ def test_pin_hash_check_survives_nonstandard_strings(admin_dsn: str):
 
 def test_employee_ids_are_by_default(fresh_db: str):
   # A clock supplies the number it chose (§6.4); a hand-added row still takes the sequence.
-  insert = "INSERT INTO employees (id, name, pin_username, pin_hash) VALUES (%s, 'Ann', %s, crypt('1', gen_salt('bf')))"
+  insert = "INSERT INTO employees (id, first_name, last_name, pin_username, pin_hash) VALUES (%s, 'Ann', 'Lee', %s, crypt('1', gen_salt('bf')))"
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute(insert, (10001, "10001"))
     assert _add_employee(c, "Bob", "34") == 1
@@ -349,7 +352,9 @@ def test_employee_ids_are_by_default(fresh_db: str):
   ],
 )
 def test_contact_checks(fresh_db: str, column: str, value: str, *, ok: bool):
-  insert = sql.SQL("INSERT INTO employees (name, pin_username, pin_hash, {}) VALUES ('Ann', '12', crypt('1', gen_salt('bf')), %s)")
+  insert = sql.SQL(
+    "INSERT INTO employees (first_name, last_name, pin_username, pin_hash, {}) VALUES ('Ann', 'Lee', '12', crypt('1', gen_salt('bf')), %s)"
+  )
   with psycopg.connect(fresh_db, autocommit=True) as c:
     if ok:
       c.execute(insert.format(sql.Identifier(column)), (value,))
@@ -378,8 +383,8 @@ def test_contact_patterns_match_the_models(fresh_db: str):
 
 def test_clock_login_adds_employees_and_managers_but_never_admins(fresh_db: str, clock_login: str):
   insert = (
-    "INSERT INTO employees (id, name, pin_username, pin_hash, role, group_id, phone, email)"
-    " VALUES (%s, 'Ann', %s, crypt('1', gen_salt('bf')), %s, 1, '+15551234567', 'ann@example.com')"
+    "INSERT INTO employees (id, first_name, middle_name, last_name, pin_username, pin_hash, role, group_id, phone, email)"
+    " VALUES (%s, 'Ann', 'B', 'Lee', %s, crypt('1', gen_salt('bf')), %s, 1, '+15551234567', 'ann@example.com')"
   )
   with psycopg.connect(clock_login, autocommit=True) as c:
     c.execute(insert, (10001, "10001", "employee"))

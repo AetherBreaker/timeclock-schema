@@ -42,7 +42,9 @@ class Employee(TimeclockModel):
   """`employees` row."""
 
   id: int
-  name: str
+  first_name: str
+  middle_name: str | None = None
+  last_name: str
   pin_username: Annotated[str, StringConstraints(pattern=r"^[0-9]+$")]
   pin_hash: SecretStr
   role: EmployeeRole = EmployeeRole.EMPLOYEE
@@ -53,6 +55,11 @@ class Employee(TimeclockModel):
   fingerprint_exempt: bool = False
   """Logs in by PIN alone: no fingerprint step and no override (§6.4)."""
   updated_at: UtcDatetime
+
+  @property
+  def display_name(self) -> str:
+    """First and last name, as the clock shows it; the middle name stays in the database."""
+    return f"{self.first_name} {self.last_name}"
 
   # JSON input needs no validator: SecretStr accepts the revealed string as is.
   @field_serializer("pin_hash", when_used="json")

@@ -77,7 +77,9 @@ def test_rule_row_needs_exactly_one_target():
 
 def test_employee_pin_username_digits_only():
   with pytest.raises(ValidationError):
-    Employee.model_validate({"id": 1, "name": "A", "pin_username": "12a", "pin_hash": "$2a$06$x", "updated_at": T})
+    Employee.model_validate(
+      {"id": 1, "first_name": "A", "last_name": "B", "pin_username": "12a", "pin_hash": "$2a$06$x", "updated_at": T}
+    )
 
 
 def test_fingerprint_template_masked_unless_revealed():
@@ -92,7 +94,9 @@ def test_fingerprint_template_masked_unless_revealed():
 
 
 def test_pin_hash_masked_unless_revealed():
-  e = Employee.model_validate({"id": 1, "name": "A", "pin_username": "12", "pin_hash": "$2a$06$abcdef", "updated_at": T})
+  e = Employee.model_validate(
+    {"id": 1, "first_name": "A", "last_name": "B", "pin_username": "12", "pin_hash": "$2a$06$abcdef", "updated_at": T}
+  )
   assert "abcdef" not in repr(e) and "abcdef" not in e.model_dump_json()
   assert "abcdef" in e.model_dump_json(context=REVEAL)
 
@@ -130,7 +134,14 @@ def test_settings_new_columns_default_when_absent():
 
 
 def test_employee_role():
-  base = {"id": 1, "name": "Ann", "pin_username": "12", "pin_hash": "x", "updated_at": datetime(2026, 10, 27, tzinfo=UTC)}
+  base = {
+    "id": 1,
+    "first_name": "Ann",
+    "last_name": "Lee",
+    "pin_username": "12",
+    "pin_hash": "x",
+    "updated_at": datetime(2026, 10, 27, tzinfo=UTC),
+  }
   assert Employee.model_validate(base).role is EmployeeRole.EMPLOYEE
   assert Employee.model_validate({**base, "role": "admin"}).role is EmployeeRole.ADMIN
   # A pre-0.3.0 payload's is_manager is ignored (extra="ignore"): it no longer grants anything.
@@ -164,7 +175,7 @@ def test_unknown_columns_are_ignored():
 
 
 def test_employee_contact_fields():
-  base = {"id": 10001, "name": "Ann", "pin_username": "10001", "pin_hash": "x", "updated_at": T}
+  base = {"id": 10001, "first_name": "Ann", "last_name": "Lee", "pin_username": "10001", "pin_hash": "x", "updated_at": T}
   e = Employee.model_validate(base)
   assert (e.phone, e.email, e.fingerprint_exempt) == (None, None, False)
   e = Employee.model_validate({**base, "phone": "+15551234567", "email": "ann@example.com", "fingerprint_exempt": True})
@@ -188,3 +199,14 @@ def test_bypass_reason_ties_the_optional_columns():
     for extra in ({"manager_id": 2}, {"pin_only": True}):
       with pytest.raises(ValidationError):
         FingerprintBypass.model_validate(base | extra | {"reason": reason})
+
+
+def test_employee_names():
+  # First and last are required, the middle name optional; the clock shows first and last.
+  base = {"id": 1, "first_name": "Ann", "last_name": "Lee", "pin_username": "12", "pin_hash": "x", "updated_at": T}
+  e = Employee.model_validate(base)
+  assert (e.first_name, e.middle_name, e.last_name, e.display_name) == ("Ann", None, "Lee", "Ann Lee")
+  assert Employee.model_validate(base | {"middle_name": "Beth"}).display_name == "Ann Lee"
+  for missing in ("first_name", "last_name"):
+    with pytest.raises(ValidationError):
+      Employee.model_validate({k: v for k, v in base.items() if k != missing})
