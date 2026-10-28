@@ -59,3 +59,26 @@ class AutoClockOutFrequency(StrEnum):
   """`auto_clock_out_frequency`: how often the automatic clock-out runs; daily only for now."""
 
   DAILY = "daily"
+
+
+class Finger(StrEnum):
+  """`finger`: which finger a print is, one per finger per person."""
+
+  LEFT_THUMB = "left_thumb"
+  LEFT_INDEX = "left_index"
+  LEFT_MIDDLE = "left_middle"
+  LEFT_RING = "left_ring"
+  LEFT_LITTLE = "left_little"
+  RIGHT_THUMB = "right_thumb"
+  RIGHT_INDEX = "right_index"
+  RIGHT_MIDDLE = "right_middle"
+  RIGHT_RING = "right_ring"
+  RIGHT_LITTLE = "right_little"
+
+
+class FingerprintChangeAction(StrEnum):
+  """`fingerprint_change_action`."""
+
+  ADD = "add"
+  REPLACE = "replace"
+  REMOVE = "remove"

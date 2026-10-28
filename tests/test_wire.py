@@ -7,7 +7,7 @@ import pytest
 from pydantic import SecretBytes, ValidationError
 
 # First party imports
-from timeclock_schema.enums import PunchKind
+from timeclock_schema.enums import Finger, PunchKind
 from timeclock_schema.models import Fingerprint, Punch
 from timeclock_schema.wire import LanFingerprint, LanPunch, Notification, dump_lan_record, load_lan_record
 
@@ -29,7 +29,9 @@ def test_lan_punch_round_trip():
 
 
 def test_lan_fingerprint_carries_the_template():
-  f = Fingerprint(id=uuid4(), employee_id=3, template=SecretBytes(b"\x01\x02tmpl"), registered_at=T, instance_id="2")
+  f = Fingerprint(
+    id=uuid4(), employee_id=3, finger=Finger.LEFT_INDEX, template=SecretBytes(b"\x01\x02tmpl"), registered_at=T, instance_id="2"
+  )
   back = load_lan_record(dump_lan_record(LanFingerprint(sender="2", fingerprint=f)))
   assert isinstance(back, LanFingerprint)
   assert back.fingerprint.template.get_secret_value() == b"\x01\x02tmpl"

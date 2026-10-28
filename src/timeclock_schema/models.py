@@ -21,7 +21,16 @@ from pydantic import (
 
 # First party imports
 from timeclock_schema.base import LocalTime, TimeclockModel, UtcDatetime
-from timeclock_schema.enums import AutoClockOutFrequency, BypassReason, CorrectionAction, EmployeeRole, PunchKind, RuleAction
+from timeclock_schema.enums import (
+  AutoClockOutFrequency,
+  BypassReason,
+  CorrectionAction,
+  EmployeeRole,
+  Finger,
+  FingerprintChangeAction,
+  PunchKind,
+  RuleAction,
+)
 
 _MASK = "**********"
 
@@ -72,6 +81,7 @@ class Fingerprint(TimeclockModel):
 
   id: UUID
   employee_id: int
+  finger: Finger
   template: SecretBytes
   registered_at: UtcDatetime
   instance_id: str
@@ -120,6 +130,21 @@ class PunchCorrection(TimeclockModel):
     if self.action is CorrectionAction.VOID and has_new_value:
       raise ValueError("a void takes neither new_at nor new_kind")
     return self
+
+
+class FingerprintChange(TimeclockModel):
+  """`fingerprint_changes` row: a print added, replaced or removed, with the approving admin (none for a first add)."""
+
+  id: UUID
+  employee_id: int
+  finger: Finger
+  action: FingerprintChangeAction
+  approved_by: int | None = None
+  pin_only: bool | None = None
+  at: UtcDatetime
+  instance_id: str
+  received_at: UtcDatetime | None = None
+  db_login: str | None = None
 
 
 class FingerprintBypass(TimeclockModel):

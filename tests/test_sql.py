@@ -26,6 +26,7 @@ from psycopg.rows import dict_row
 from pydantic import StringConstraints, TypeAdapter, ValidationError
 
 # First party imports
+from timeclock_schema.enums import Finger
 from timeclock_schema.migrations import load_migrations
 from timeclock_schema.models import (
   EMAIL_PATTERN,
@@ -35,6 +36,7 @@ from timeclock_schema.models import (
   Employee,
   Fingerprint,
   FingerprintBypass,
+  FingerprintChange,
   Group,
   Punch,
   PunchCorrection,
@@ -219,8 +221,8 @@ def test_clock_login_can_insert_and_read_only(fresh_db: str, clock_login: str):
         (login_id, manager_id, T),
       )
       c.execute(
-        "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id)"
-        " VALUES (%s, %s, %s, %s, '1') ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO fingerprints (id, employee_id, finger, template, registered_at, instance_id)"
+        " VALUES (%s, %s, 'left_index', %s, %s, '1') ON CONFLICT (id) DO NOTHING",
         (fingerprint_id, employee_id, b"tmpl", T),
       )
     assert c.execute("SELECT count(*), min(db_login) FROM punches").fetchone() == (1, role)
@@ -445,14 +447,128 @@ def test_hours_settings_checks(fresh_db: str, statement: LiteralString):
     c.execute(statement)
 
 
+def _add_print(c: psycopg.Connection, employee_id: int, finger: str = "left_index") -> str:
+  fingerprint_id = str(uuid4())
+  c.execute(
+    "INSERT INTO fingerprints (id, employee_id, finger, template, registered_at, instance_id) VALUES (%s, %s, %s, 't', %s, '1')",
+    (fingerprint_id, employee_id, finger, T),
+  )
+  return fingerprint_id
+
+
+def test_finger_values_match_the_sql(fresh_db: str):
+  with psycopg.connect(fresh_db) as c:
+    assert c.execute("SELECT enum_range(NULL::finger)::text").fetchone() == ("{" + ",".join(Finger) + "}",)
+
+
+def test_fingerprints_need_a_finger(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id = _add_employee(c)
+    with pytest.raises(errors.NotNullViolation):
+      c.execute(
+        "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id) VALUES (%s, %s, 't', %s, '1')",
+        (uuid4(), employee_id, T),
+      )
+
+
+def test_one_print_per_finger(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
+    _add_print(c, ann)
+    with pytest.raises(errors.UniqueViolation):
+      _add_print(c, ann)
+    _add_print(c, ann, "right_index")
+    _add_print(c, bob)
+    assert c.execute("SELECT count(*) FROM fingerprints").fetchone() == (3,)
+
+
+def test_clock_login_can_delete_prints(fresh_db: str, clock_login: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    fingerprint_id = _add_print(c, employee_id)
+    c.execute("DELETE FROM fingerprints WHERE id = %s", (fingerprint_id,))
+    assert c.execute("SELECT count(*) FROM fingerprints").fetchone() == (0,)
+
+
+_CHANGE_INSERT: LiteralString = (
+  "INSERT INTO fingerprint_changes (id, employee_id, finger, action, approved_by, pin_only, at, instance_id)"
+  " VALUES (%s, %s, 'left_index', %s, %s, %s, %s, '1')"
+)
+
+
+@pytest.mark.parametrize(
+  ("action", "approved", "pin_only", "ok"),
+  [
+    ("add", False, None, True),
+    ("add", True, False, True),
+    ("replace", True, True, True),
+    ("remove", True, False, True),
+    ("replace", False, None, False),
+    ("remove", False, None, False),
+    ("add", True, None, False),
+    ("add", False, True, False),
+  ],
+)
+def test_fingerprint_change_checks(fresh_db: str, action: str, *, approved: bool, pin_only: bool | None, ok: bool):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id, admin_id = _add_employee(c), _add_employee(c, "Ada", "34")
+    params = (uuid4(), employee_id, action, admin_id if approved else None, pin_only, T)
+    if ok:
+      c.execute(_CHANGE_INSERT, params)
+    else:
+      with pytest.raises(errors.CheckViolation):
+        c.execute(_CHANGE_INSERT, params)
+
+
+def test_clock_login_inserts_fingerprint_changes(fresh_db: str, clock_login: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id, admin_id = _add_employee(admin), _add_employee(admin, "Ada", "34")
+  role = conninfo_to_dict(clock_login)["user"]
+  change_id = uuid4()
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    for _ in range(2):
+      c.execute(_CHANGE_INSERT + " ON CONFLICT (id) DO NOTHING", (change_id, employee_id, "remove", admin_id, False, T))
+    for statement in ("UPDATE fingerprint_changes SET pin_only = true", "DELETE FROM fingerprint_changes"):
+      with pytest.raises(errors.InsufficientPrivilege):
+        c.execute(statement)
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT count(*), min(db_login) FROM fingerprint_changes").fetchone() == (1, role)
+
+
+def test_0002_refuses_existing_prints(admin_dsn: str):
+  name = f"tcs_{uuid4().hex}"
+  with psycopg.connect(admin_dsn, autocommit=True) as admin:
+    admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+  try:
+    first, second = load_migrations()[:2]
+    with psycopg.connect(make_conninfo(admin_dsn, dbname=name), autocommit=True) as c:
+      c.execute(cast("LiteralString", first.sql))
+      employee_id = _add_employee(c)
+      c.execute(
+        "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id) VALUES (%s, %s, 't', %s, '1')",
+        (uuid4(), employee_id, T),
+      )
+      with pytest.raises(errors.RaiseException, match="fingerprints"):
+        c.execute(cast("LiteralString", second.sql))
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
+
+
 def test_every_table_loads_into_its_model(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO groups (name) VALUES ('night')")
     employee_id, manager_id = _add_employee(c), _add_employee(c, "Bob", "34")
     punch_id = _add_punch(c, employee_id)
     c.execute(
-      "INSERT INTO fingerprints (id, employee_id, template, registered_at, instance_id) VALUES (%s, %s, %s, %s, '1')",
+      "INSERT INTO fingerprints (id, employee_id, finger, template, registered_at, instance_id) VALUES (%s, %s, 'left_index', %s, %s, '1')",
       (uuid4(), employee_id, b"tmpl", T),
+    )
+    c.execute(
+      "INSERT INTO fingerprint_changes (id, employee_id, finger, action, approved_by, pin_only, at, instance_id)"
+      " VALUES (%s, %s, 'left_index', 'replace', %s, true, %s, '1')",
+      (uuid4(), employee_id, manager_id, T),
     )
     c.execute("INSERT INTO punch_corrections (punch_id, action, new_at) VALUES (%s, 'amend', %s)", (punch_id, T))
     c.execute(
@@ -474,6 +590,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
       ("punches", Punch),
       ("punch_corrections", PunchCorrection),
       ("fingerprint_bypasses", FingerprintBypass),
+      ("fingerprint_changes", FingerprintChange),
       ("rules", RuleRow),
       ("config.business_hours", BusinessHours),
       ("config.settings", Settings),
@@ -488,6 +605,7 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     "punches": 1,
     "punch_corrections": 1,
     "fingerprint_bypasses": 2,
+    "fingerprint_changes": 1,
     "rules": 1,
     "config.business_hours": 1,
     "config.settings": 1,
