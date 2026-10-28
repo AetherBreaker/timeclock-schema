@@ -11,7 +11,15 @@ from pydantic import ValidationError
 
 # First party imports
 from timeclock_schema.base import REVEAL
-from timeclock_schema.enums import AutoClockOutFrequency, BypassReason, CorrectionAction, EmployeeRole, PunchKind, RuleAction
+from timeclock_schema.enums import (
+  AutoClockOutFrequency,
+  BypassReason,
+  CorrectionAction,
+  EmployeeRole,
+  Finger,
+  PunchKind,
+  RuleAction,
+)
 from timeclock_schema.models import (
   AutoClockOutRun,
   BusinessHours,
@@ -84,13 +92,20 @@ def test_employee_pin_username_digits_only():
 
 def test_fingerprint_template_masked_unless_revealed():
   f = Fingerprint.model_validate(
-    {"id": uuid4(), "employee_id": 1, "template": b"\x00secret-bytes", "registered_at": T, "instance_id": "1"}
+    {"id": uuid4(), "employee_id": 1, "finger": "left_index", "template": b"\x00secret-bytes", "registered_at": T, "instance_id": "1"}
   )
   encoded = base64.b64encode(b"\x00secret-bytes").decode()
   for text in (repr(f), str(f), f.model_dump_json()):
     assert "secret-bytes" not in text and encoded not in text
   assert encoded in f.model_dump_json(context=REVEAL)
   assert Fingerprint.model_validate_json(f.model_dump_json(context=REVEAL)).template.get_secret_value() == b"\x00secret-bytes"
+
+
+def test_fingerprint_needs_a_finger():
+  base = {"id": uuid4(), "employee_id": 1, "template": b"t", "registered_at": T, "instance_id": "1"}
+  with pytest.raises(ValidationError):
+    Fingerprint.model_validate(base)
+  assert Fingerprint.model_validate({**base, "finger": "right_little"}).finger is Finger.RIGHT_LITTLE
 
 
 def test_pin_hash_masked_unless_revealed():

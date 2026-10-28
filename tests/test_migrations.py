@@ -19,6 +19,11 @@ def test_initial_migration_is_first():
   assert "CREATE TABLE punches" in first.sql
 
 
+def test_second_migration_labels_fingers():
+  second = load_migrations()[1]
+  assert (second.version, second.name) == (2, "fingerprint_fingers")
+
+
 def test_versions_are_contiguous():
   assert [m.version for m in load_migrations()] == list(range(1, len(load_migrations()) + 1))
 
