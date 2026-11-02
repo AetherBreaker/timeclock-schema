@@ -269,17 +269,50 @@ def test_correction_check_constraint(fresh_db: str):
     c.execute("INSERT INTO punch_corrections (punch_id, action, new_kind) VALUES (%s, 'amend', 'clock_out')", (punch_id,))
 
 
-def test_punch_log_shows_current_name_and_latest_correction(fresh_db: str):
+def _add_punch_at(c: psycopg.Connection, employee_id: int, kind: str, at: datetime) -> str:
+  punch_id = str(uuid4())
+  c.execute(
+    "INSERT INTO punches (id, employee_id, kind, at, instance_id) VALUES (%s, %s, %s, %s, '1')", (punch_id, employee_id, kind, at)
+  )
+  return punch_id
+
+
+def test_punch_log_shows_punches_as_corrected_in_corrected_order(fresh_db: str):
+  # The export reads this view: the newest correction's time and type stand in for the original, and order follows them.
+  hour = timedelta(hours=1)
   with psycopg.connect(fresh_db, autocommit=True) as c:
     employee_id = _add_employee(c)
-    punch_id = _add_punch(c, employee_id)
+    first = _add_punch_at(c, employee_id, "clock_in", T)
+    second = _add_punch_at(c, employee_id, "clock_out", T + hour)
     c.execute(
-      "INSERT INTO punch_corrections (punch_id, action, recorded_at) VALUES (%s, 'void', now() - interval '1 hour')", (punch_id,)
+      "INSERT INTO punch_corrections (punch_id, action, new_at, new_kind) VALUES (%s, 'amend', %s, 'clock_in')", (second, T - hour)
     )
-    c.execute("INSERT INTO punch_corrections (punch_id, action, new_kind) VALUES (%s, 'amend', 'clock_out')", (punch_id,))
+    # A void, then a newer amend: the amend wins and brings the punch back, with the type it sets and its original time.
+    c.execute("INSERT INTO punch_corrections (punch_id, action, recorded_at) VALUES (%s, 'void', now() - interval '1 hour')", (first,))
+    c.execute("INSERT INTO punch_corrections (punch_id, action, new_kind, note) VALUES (%s, 'amend', 'break_start', 'x')", (first,))
     c.execute("UPDATE employees SET middle_name = 'B' WHERE id = %s", (employee_id,))
-    row = c.execute("SELECT employee_name, correction, db_login FROM punch_log WHERE id = %s", (punch_id,)).fetchone()
-  assert row == ("Ann B Lee", "amend", "postgres")
+    rows = c.execute("SELECT id::text, employee_name, kind::text, at, correction_note, db_login FROM punch_log").fetchall()
+  assert rows == [
+    (second, "Ann B Lee", "clock_in", T - hour, "", "postgres"),
+    (first, "Ann B Lee", "break_start", T, "x", "postgres"),
+  ]
+
+
+def test_punch_log_leaves_out_voided_punches(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id = _add_employee(c)
+    kept, voided = _add_punch_at(c, employee_id, "clock_in", T), _add_punch_at(c, employee_id, "clock_out", T)
+    c.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (voided,))
+    ids = [r[0] for r in c.execute("SELECT id::text FROM punch_log").fetchall()]
+  assert ids == [kept]
+
+
+def test_punch_log_has_no_correction_columns(fresh_db: str):
+  # Only the corrected values: the correction's action and new values aren't columns (owner, 2026-11-02).
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    columns = {r[0] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'punch_log'")}
+  assert {"kind", "at", "correction_note", "corrected_at"} <= columns
+  assert not columns & {"correction", "new_at", "new_kind"}
 
 
 @pytest.mark.parametrize(
