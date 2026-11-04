@@ -261,6 +261,18 @@ def test_owner_can_update_and_delete_punches(fresh_db: str):
     assert c.execute("DELETE FROM punches WHERE id = %s", (punch_id,)).rowcount == 1
 
 
+def test_owner_adds_punches_without_an_id(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id = _add_employee(c)
+    ids = c.execute(
+      "INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%(e)s, 'clock_in', %(at)s, 'manual'),"
+      " (%(e)s, 'clock_out', %(at)s, 'manual') RETURNING id",
+      {"e": employee_id, "at": T},
+    ).fetchall()
+  (first,), (second,) = ids
+  assert first != second
+
+
 def test_correction_check_constraint(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     punch_id = _add_punch(c, _add_employee(c))
