@@ -428,6 +428,39 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
   assert (ann, date(2026, 10, 19)) in got and (ann, date(2026, 10, 26)) in got
 
 
+def test_new_employee_names_are_capitalized_unless_typed_mixed(fresh_db: str):
+  typed_and_stored = [
+    ("don", "Don"),
+    ("SMITH", "Smith"),
+    ("o'brien", "O'Brien"),
+    ("SMITH-JONES", "Smith-Jones"),
+    ("deNiro", "Deniro"),  # a lowercase first letter
+    ("josé", "José"),
+    ("DeNiro", "DeNiro"),
+    ("McBee", "McBee"),
+    ("Ann", "Ann"),
+  ]
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    stored = [
+      c.execute(
+        "INSERT INTO employees (first_name, middle_name, last_name, pin_username, pin_hash)"
+        " VALUES (%s, %s, %s, %s, crypt('1234', gen_salt('bf'))) RETURNING first_name, middle_name, last_name",
+        (typed, typed, typed, str(n)),
+      ).fetchone()
+      for n, (typed, _) in enumerate(typed_and_stored)
+    ]
+    no_middle = c.execute(
+      "INSERT INTO employees (first_name, last_name, pin_username, pin_hash) VALUES ('ann', 'lee', '99', crypt('1234', gen_salt('bf')))"
+      " RETURNING id, middle_name"
+    ).fetchone()
+    assert no_middle is not None
+    # Inserts only: the owner's edit is kept as typed.
+    edited = c.execute("UPDATE employees SET first_name = 'deNiro' WHERE id = %s RETURNING first_name", (no_middle[0],)).fetchone()
+  assert stored == [(s, s, s) for _, s in typed_and_stored]
+  assert no_middle[1] is None
+  assert edited == ("deNiro",)
+
+
 @pytest.mark.parametrize(
   "statement",
   [
