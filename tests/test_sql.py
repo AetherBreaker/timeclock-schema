@@ -1191,6 +1191,7 @@ def test_clock_login_inserts_scans_only(fresh_db: str, clock_login: str):
 
 
 def test_scan_log_names_prints_and_outcome(fresh_db: str):
+  now = datetime.now(UTC)  # not T: a scan over 28 days old loses its image at the next insert
   with psycopg.connect(fresh_db, autocommit=True) as c:
     employee_id, other_id = _add_employee(c), _add_employee(c, "Bob", "34")
     punch_id = _add_punch(c, employee_id)
@@ -1200,11 +1201,11 @@ def test_scan_log_names_prints_and_outcome(fresh_db: str):
       "INSERT INTO fingerprint_scans (id, at, instance_id, result, best_fingerprint_id, best_employee_id, best_finger,"
       " best_score, other_fingerprint_id, other_employee_id, other_finger, other_score, margin, outcome, punch_id, image)"
       " VALUES (%s, %s, '1', 'matched', %s, %s, 'left_index', 90, %s, %s, 'right_thumb', 60, 15, 'punched', %s, %s)",
-      (uuid4(), T, best_print, employee_id, other_print, other_id, punch_id, b"img"),
+      (uuid4(), now, best_print, employee_id, other_print, other_id, punch_id, b"img"),
     )
     c.execute(
       "INSERT INTO fingerprint_scans (id, at, instance_id, result, margin, retry_message) VALUES (%s, %s, '1', 'retry', 15, 'move')",
-      (uuid4(), T + timedelta(minutes=1)),
+      (uuid4(), now + timedelta(minutes=1)),
     )
     rows = c.cursor(row_factory=dict_row).execute("SELECT * FROM scan_log").fetchall()
   assert [r["result"] for r in rows] == ["retry", "matched"]
@@ -1221,3 +1222,44 @@ def test_scan_log_names_prints_and_outcome(fresh_db: str):
   )
   assert (matched["margin"], matched["outcome"], matched["punch_kind"], matched["has_image"]) == (15, "punched", "clock_in", True)
   assert "image" not in matched and "probe" not in matched
+
+
+_INSERT_SCAN_WITH_DATA = (
+  "INSERT INTO fingerprint_scans (id, at, instance_id, result, margin, probe, image, image_width, image_height)"
+  " VALUES (%s, %s, '1', 'no_match', 15, 'probe', 'image', 160, 120)"
+)
+_CLEARED = (
+  "SELECT probe IS NULL AND image IS NULL AND image_width IS NULL AND image_height IS NULL FROM fingerprint_scans WHERE id = %s"
+)
+
+
+def test_a_clock_insert_clears_fingerprint_data_older_than_28_days(fresh_db: str, clock_login: str):
+  now = datetime.now(UTC)
+  old, recent, late, new = uuid4(), uuid4(), uuid4(), uuid4()
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    for scan_id in (old, recent):
+      admin.execute(_INSERT_SCAN_WITH_DATA, (scan_id, now - timedelta(days=27)))
+    # Aged by UPDATE: an insert this old would be cleared by its own statement.
+    admin.execute("UPDATE fingerprint_scans SET at = %s WHERE id = %s", (now - timedelta(days=29), old))
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    c.execute(_INSERT_SCAN_WITH_DATA, (new, now))
+    c.execute(_INSERT_SCAN_WITH_DATA, (late, now - timedelta(days=30)))  # a clock that was offline a month
+  with psycopg.connect(fresh_db) as admin:
+    cleared = {s: admin.execute(_CLEARED, (s,)).fetchone() for s in (old, recent, late, new)}
+    kept = admin.execute("SELECT result, margin FROM fingerprint_scans WHERE id = %s", (old,)).fetchone()
+  assert cleared == {old: (True,), recent: (False,), late: (True,), new: (False,)}
+  assert kept == ("no_match", 15)
+
+
+def test_an_insert_skips_the_prune_while_another_runs_it(fresh_db: str, clock_login: str):
+  now, old = datetime.now(UTC), uuid4()
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute(_INSERT_SCAN_WITH_DATA, (old, now))
+    admin.execute("UPDATE fingerprint_scans SET at = %s WHERE id = %s", (now - timedelta(days=29), old))
+  with psycopg.connect(fresh_db) as pruning, psycopg.connect(clock_login, autocommit=True) as c:
+    pruning.execute("SELECT pg_advisory_xact_lock(7461726504)")  # held until rollback, like a prune under way
+    c.execute(_INSERT_SCAN_WITH_DATA, (uuid4(), now))  # doesn't wait for the lock
+    assert pruning.execute(_CLEARED, (old,)).fetchone() == (False,)
+    pruning.rollback()
+    c.execute(_INSERT_SCAN_WITH_DATA, (uuid4(), now))
+    assert pruning.execute(_CLEARED, (old,)).fetchone() == (True,)
