@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, LiteralString, cast, get_args
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 # Third party imports
 import psycopg
@@ -43,6 +44,7 @@ from timeclock_schema.models import (
   RuleRow,
   Settings,
 )
+from timeclock_schema.shifts import total_hours, week_bounds
 from timeclock_schema.wire import NOTIFY_CHANNEL, Notification, NotifyTable
 
 if TYPE_CHECKING:
@@ -313,6 +315,117 @@ def test_punch_log_has_no_correction_columns(fresh_db: str):
     columns = {r[0] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'punch_log'")}
   assert {"kind", "at", "correction_note", "corrected_at"} <= columns
   assert not columns & {"correction", "new_at", "new_kind"}
+
+
+NY = ZoneInfo("America/New_York")
+
+
+def _ny(day: int, hour: int, minute: int = 0, second: int = 0, month: int = 10) -> datetime:
+  return datetime(2026, month, day, hour, minute, second, tzinfo=NY)
+
+
+def _hm(td: timedelta) -> str:
+  seconds = int(td.total_seconds())
+  return f"{seconds // 3600}:{seconds // 60 % 60:02d}"
+
+
+def test_weekly_hours_formats_one_row_per_employee_for_the_week(fresh_db: str):
+  # The payroll export: one week's rows by its Monday. Ann's Monday: 8:05:59 in, two 20-minute breaks (30 paid), a
+  # 30-minute lunch, so 6:55:59 worked; Tuesday 8:00 more.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+    ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
+    for kind, at in [
+      ("clock_in", _ny(19, 9)),
+      ("break_start", _ny(19, 10)),
+      ("break_end", _ny(19, 10, 20)),
+      ("lunch_start", _ny(19, 12)),
+      ("lunch_end", _ny(19, 12, 30)),
+      ("break_start", _ny(19, 15)),
+      ("break_end", _ny(19, 15, 20)),
+      ("clock_out", _ny(19, 17, 5, 59)),
+      ("clock_in", _ny(20, 9)),
+      ("clock_out", _ny(20, 17)),
+      ("clock_in", _ny(26, 9)),  # the next week
+      ("clock_out", _ny(26, 10)),
+    ]:
+      _add_punch_at(c, ann, kind, at)
+    _add_punch_at(c, bob, "clock_in", _ny(21, 9))
+    _add_punch_at(c, bob, "clock_out", _ny(21, 9, 5))
+    rows = c.execute("SELECT employee_name, hours, breaks FROM weekly_hours WHERE week_of = '2026-10-19'").fetchall()
+    columns = [
+      r[0]
+      for r in c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'weekly_hours' ORDER BY ordinal_position"
+      )
+    ]
+  assert rows == [("Ann Lee", "14:55", "0:30"), ("Bob Lee", "0:05", "0:00")]
+  assert columns == ["employee_id", "employee_name", "week_of", "hours", "breaks"]
+
+
+def test_weekly_hours_matches_total_hours(fresh_db: str):
+  # The view repeats total_hours's rules; each week's totals must be the same. Covered: the daily allowance spent across
+  # two breaks, lunch, a repeated clock-in and a stray break end, a void and an amend, a shift and a break across Monday
+  # 00:00, a shift across the end of DST, and a shift still open, on a break, with an automatic clock-out stamped later.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+    ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
+    for kind, at in [
+      ("clock_in", _ny(20, 9)),
+      ("break_start", _ny(20, 10)),
+      ("break_end", _ny(20, 10, 20)),
+      ("lunch_start", _ny(20, 12)),
+      ("lunch_end", _ny(20, 12, 45)),
+      ("break_start", _ny(20, 13)),
+      ("break_end", _ny(20, 13, 20)),
+      ("clock_out", _ny(20, 17)),
+      ("clock_in", _ny(21, 9)),
+      ("clock_in", _ny(21, 9, 5)),
+      ("break_end", _ny(21, 9, 30)),
+      ("clock_in", _ny(25, 22)),  # Sunday into Monday
+      ("break_start", _ny(25, 23, 50)),
+      ("break_end", _ny(26, 0, 20)),
+      ("clock_out", _ny(26, 2)),
+      ("clock_in", datetime(2026, 11, 1, 4, 30, tzinfo=UTC)),  # 00:30 EDT to 03:30 EST: 4 hours
+      ("clock_out", datetime(2026, 11, 1, 8, 30, tzinfo=UTC)),
+    ]:
+      _add_punch_at(c, ann, kind, at)
+    amended = _add_punch_at(c, ann, "clock_out", _ny(21, 17))
+    c.execute("INSERT INTO punch_corrections (punch_id, action, new_at) VALUES (%s, 'amend', %s)", (amended, _ny(21, 17, 30)))
+    voided = _add_punch_at(c, ann, "break_start", _ny(21, 11))
+    c.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (voided,))
+    row = c.execute("SELECT now()").fetchone()
+    assert row is not None
+    for kind, ago in [("clock_in", 3), ("lunch_start", 2.5), ("lunch_end", 2), ("break_start", 0.75)]:
+      _add_punch_at(c, bob, kind, row[0] - timedelta(hours=ago))
+    c.execute(
+      "INSERT INTO punches (id, employee_id, kind, at, instance_id, automatic) VALUES (%s, %s, 'clock_out', %s, '1', true)",
+      (uuid4(), bob, row[0] + timedelta(hours=1)),
+    )
+    with c.transaction():  # one now() for the view and the expectation
+      row = c.execute("SELECT now()").fetchone()
+      assert row is not None
+      now = row[0]
+      got = {(r[0], r[1]): (r[2], r[3]) for r in c.execute("SELECT employee_id, week_of, hours, breaks FROM weekly_hours")}
+    with c.cursor(row_factory=dict_row) as cur:
+      settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
+      expected = {}
+      for employee_id in (ann, bob):
+        punches = [Punch.model_validate(r) for r in cur.execute("SELECT * FROM punches WHERE employee_id = %s", (employee_id,))]
+        corrections = [
+          PunchCorrection.model_validate(r)
+          for r in cur.execute(
+            "SELECT pc.* FROM punch_corrections pc JOIN punches p ON p.id = pc.punch_id WHERE p.employee_id = %s", (employee_id,)
+          )
+        ]
+        start, end = week_bounds(min(p.at for p in punches), NY)
+        while start < now:
+          t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
+          if t.worked + t.paid_break + t.unpaid > timedelta():  # any shift time that week
+            expected[employee_id, start.astimezone(NY).date()] = (_hm(t.worked), _hm(t.paid_break))
+          start, end = week_bounds(end, NY)
+  assert got == expected
+  assert (ann, date(2026, 10, 19)) in got and (ann, date(2026, 10, 26)) in got
 
 
 @pytest.mark.parametrize(
