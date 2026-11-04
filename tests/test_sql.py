@@ -342,8 +342,8 @@ def _hm(td: timedelta) -> str:
 
 
 def test_weekly_hours_formats_one_row_per_employee_for_the_week(fresh_db: str):
-  # The payroll export: one week's rows by its Monday. Ann's Monday: 8:05:59 in, two 20-minute breaks (30 paid), a
-  # 30-minute lunch, so 6:55:59 worked; Tuesday 8:00 more.
+  # The payroll export: one week's rows by its Monday. Ann's Monday: 8:05:59 in, two 20-minute breaks (30 paid, 10
+  # unpaid), a 30-minute lunch, so 6:55:59 worked; Tuesday 8:00 more.
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
     ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
@@ -364,15 +364,17 @@ def test_weekly_hours_formats_one_row_per_employee_for_the_week(fresh_db: str):
       _add_punch_at(c, ann, kind, at)
     _add_punch_at(c, bob, "clock_in", _ny(21, 9))
     _add_punch_at(c, bob, "clock_out", _ny(21, 9, 5))
-    rows = c.execute("SELECT employee_name, hours, breaks FROM weekly_hours WHERE week_of = '2026-10-19'").fetchall()
+    rows = c.execute(
+      "SELECT employee_name, hours, breaks, lunches, unpaid_breaks FROM weekly_hours WHERE week_of = '2026-10-19'"
+    ).fetchall()
     columns = [
       r[0]
       for r in c.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'weekly_hours' ORDER BY ordinal_position"
       )
     ]
-  assert rows == [("Ann Lee", "14:55", "0:30"), ("Bob Lee", "0:05", "0:00")]
-  assert columns == ["employee_id", "employee_name", "week_of", "hours", "breaks"]
+  assert rows == [("Ann Lee", "14:55", "0:30", "0:30", "0:10"), ("Bob Lee", "0:05", "0:00", "0:00", "0:00")]
+  assert columns == ["employee_id", "employee_name", "week_of", "hours", "breaks", "lunches", "unpaid_breaks"]
 
 
 def test_weekly_hours_matches_total_hours(fresh_db: str):
@@ -418,10 +420,13 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
       row = c.execute("SELECT now()").fetchone()
       assert row is not None
       now = row[0]
-      got = {(r[0], r[1]): (r[2], r[3]) for r in c.execute("SELECT employee_id, week_of, hours, breaks FROM weekly_hours")}
+      got = {
+        (r[0], r[1]): r[2:] for r in c.execute("SELECT employee_id, week_of, hours, breaks, lunches, unpaid_breaks FROM weekly_hours")
+      }
     log = c.execute("SELECT employee_id, id, kind::text, at FROM punch_log").fetchall()
     with c.cursor(row_factory=dict_row) as cur:
       settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
+      all_paid = settings.model_copy(update={"paid_break_minutes": 24 * 60})
       expected = {}
       expected_log = []
       left_out = []
@@ -442,8 +447,15 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
         start, end = week_bounds(min(p.at for p in punches), NY)
         while start < now:
           t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
+          # total_hours's unpaid is lunch plus unpaid break; with every break paid, it's lunch alone.
+          lunch = total_hours(punches, corrections, settings=all_paid, tz=NY, start=start, end=end, now=now).unpaid
           if t.worked + t.paid_break + t.unpaid > timedelta():  # any shift time that week
-            expected[employee_id, start.astimezone(NY).date()] = (_hm(t.worked), _hm(t.paid_break))
+            expected[employee_id, start.astimezone(NY).date()] = (
+              _hm(t.worked),
+              _hm(t.paid_break),
+              _hm(lunch),
+              _hm(t.unpaid - lunch),
+            )
           start, end = week_bounds(end, NY)
   assert got == expected
   assert (ann, date(2026, 10, 19)) in got and (ann, date(2026, 10, 26)) in got
