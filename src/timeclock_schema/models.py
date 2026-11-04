@@ -30,6 +30,8 @@ from timeclock_schema.enums import (
   FingerprintChangeAction,
   PunchKind,
   RuleAction,
+  ScanOutcome,
+  ScanResult,
 )
 
 _MASK = "**********"
@@ -96,6 +98,35 @@ class Fingerprint(TimeclockModel):
   @classmethod
   def _decode_template(cls, value: object) -> object:
     return base64.b64decode(value, validate=True) if isinstance(value, str) else value
+
+
+class FingerprintScan(TimeclockModel):
+  """`fingerprint_scans` row: one scan, with its best and next-best prints; `probe` and `image` are biometric."""
+
+  id: UUID
+  at: UtcDatetime
+  instance_id: str
+  result: ScanResult
+  best_fingerprint_id: UUID | None = None
+  best_employee_id: int | None = None
+  best_finger: Finger | None = None
+  best_score: int | None = None
+  other_fingerprint_id: UUID | None = None
+  other_employee_id: int | None = None
+  other_finger: Finger | None = None
+  other_score: int | None = None
+  scores: dict[UUID, int] = Field(default_factory=dict)
+  """Every print's score, by fingerprint id."""
+  margin: int
+  outcome: ScanOutcome | None = None
+  punch_id: UUID | None = None
+  retry_message: str | None = None
+  probe: SecretBytes | None = None
+  image: SecretBytes | None = None
+  image_width: int | None = None
+  image_height: int | None = None
+  received_at: UtcDatetime | None = None
+  db_login: str | None = None
 
 
 class Punch(TimeclockModel):
@@ -222,6 +253,10 @@ class Settings(TimeclockModel):
   """Paid break time allowed per local day; break time beyond it is unpaid (§4.5)."""
   weekly_hours_alert: Annotated[Decimal, Field(gt=0, max_digits=6, decimal_places=2)] = Decimal(40)
   """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
+  save_scan_images: bool = True
+  """Whether the clocks store each scan's image in `fingerprint_scans`."""
+  fingerprint_match_margin: Annotated[int, Field(ge=0)] = 15
+  """How far the best score must beat the best of a different employee's to count as a match."""
 
 
 class AutoClockOutRun(TimeclockModel):

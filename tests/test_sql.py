@@ -1144,3 +1144,80 @@ def test_unrelated_settings_edit_reprojects_identically(fresh_db: str):
     before = _runs(c)
     c.execute("UPDATE config.settings SET breaks_enabled = false")
     assert _runs(c) == before
+
+
+def test_settings_default_the_scan_switches(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    assert c.execute("SELECT save_scan_images, fingerprint_match_margin FROM config.settings").fetchone() == (True, 15)
+    with pytest.raises(errors.CheckViolation):
+      c.execute("UPDATE config.settings SET fingerprint_match_margin = -1")
+
+
+_SCAN_COLUMNS = (
+  "id, at, instance_id, result, best_fingerprint_id, best_employee_id, best_finger, best_score, other_fingerprint_id,"
+  " other_employee_id, other_finger, other_score, scores, margin, outcome, punch_id, retry_message, probe, image,"
+  " image_width, image_height"
+)
+
+
+def test_clock_login_inserts_scans_only(fresh_db: str, clock_login: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    punch_id = _add_punch(admin, employee_id)
+    print_id = _add_print(admin, employee_id)
+  role = conninfo_to_dict(clock_login)["user"]
+  scan_id = uuid4()
+  insert = (
+    f"INSERT INTO fingerprint_scans ({_SCAN_COLUMNS}) VALUES (%s, %s, '1', 'matched', %s, %s, 'left_index', 90, %s, %s,"
+    " 'right_index', 50, %s::jsonb, 15, 'punched', %s, 'msg', %s, %s, 160, 120)"
+  )
+  params = (scan_id, T, print_id, employee_id, print_id, employee_id, f'{{"{print_id}": 40}}', punch_id, b"probe", b"image")
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    for _ in range(2):
+      c.execute(insert + " ON CONFLICT (id) DO NOTHING", params)
+    for statement in (
+      "SELECT image FROM fingerprint_scans",
+      "UPDATE fingerprint_scans SET margin = 1",
+      "DELETE FROM fingerprint_scans",
+    ):
+      with pytest.raises(errors.InsufficientPrivilege):
+        c.execute(cast("LiteralString", statement))
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT count(*), min(db_login), bool_and(received_at IS NOT NULL) FROM fingerprint_scans").fetchone() == (
+      1,
+      role,
+      True,
+    )
+
+
+def test_scan_log_names_prints_and_outcome(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    employee_id, other_id = _add_employee(c), _add_employee(c, "Bob", "34")
+    punch_id = _add_punch(c, employee_id)
+    c.execute("UPDATE employees SET middle_name = 'Q' WHERE id = %s", (employee_id,))
+    best_print, other_print = _add_print(c, employee_id), _add_print(c, other_id, "right_thumb")
+    c.execute(
+      "INSERT INTO fingerprint_scans (id, at, instance_id, result, best_fingerprint_id, best_employee_id, best_finger,"
+      " best_score, other_fingerprint_id, other_employee_id, other_finger, other_score, margin, outcome, punch_id, image)"
+      " VALUES (%s, %s, '1', 'matched', %s, %s, 'left_index', 90, %s, %s, 'right_thumb', 60, 15, 'punched', %s, %s)",
+      (uuid4(), T, best_print, employee_id, other_print, other_id, punch_id, b"img"),
+    )
+    c.execute(
+      "INSERT INTO fingerprint_scans (id, at, instance_id, result, margin, retry_message) VALUES (%s, %s, '1', 'retry', 15, 'move')",
+      (uuid4(), T + timedelta(minutes=1)),
+    )
+    rows = c.cursor(row_factory=dict_row).execute("SELECT * FROM scan_log").fetchall()
+  assert [r["result"] for r in rows] == ["retry", "matched"]
+  retry, matched = rows
+  assert retry["retry_message"] == "move"
+  assert (retry["employee_name"], retry["other_name"], retry["finger"], retry["has_image"]) == (None, None, None, False)
+  assert matched["employee_name"] == "Ann Q Lee"
+  assert matched["other_name"] == "Bob Lee"
+  assert (matched["finger"], matched["score"], matched["other_finger"], matched["other_score"]) == (
+    "left_index",
+    90,
+    "right_thumb",
+    60,
+  )
+  assert (matched["margin"], matched["outcome"], matched["punch_kind"], matched["has_image"]) == (15, "punched", "clock_in", True)
+  assert "image" not in matched and "probe" not in matched

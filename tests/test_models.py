@@ -19,6 +19,8 @@ from timeclock_schema.enums import (
   Finger,
   PunchKind,
   RuleAction,
+  ScanOutcome,
+  ScanResult,
 )
 from timeclock_schema.models import (
   AutoClockOutRun,
@@ -26,6 +28,7 @@ from timeclock_schema.models import (
   Employee,
   Fingerprint,
   FingerprintBypass,
+  FingerprintScan,
   Group,
   Punch,
   PunchCorrection,
@@ -225,3 +228,44 @@ def test_employee_names():
   for missing in ("first_name", "last_name"):
     with pytest.raises(ValidationError):
       Employee.model_validate({k: v for k, v in base.items() if k != missing})
+
+
+def test_settings_scan_defaults():
+  s = Settings()
+  assert (s.save_scan_images, s.fingerprint_match_margin) == (True, 15)
+  with pytest.raises(ValidationError):
+    Settings(fingerprint_match_margin=-1)
+
+
+def test_fingerprint_scan_round_trips():
+  fingerprint_id = uuid4()
+  data = {
+    "id": uuid4(),
+    "at": T,
+    "instance_id": "1",
+    "result": "matched",
+    "best_fingerprint_id": fingerprint_id,
+    "best_employee_id": 1,
+    "best_finger": "left_index",
+    "best_score": 90,
+    "other_fingerprint_id": uuid4(),
+    "other_employee_id": 2,
+    "other_finger": "right_thumb",
+    "other_score": 50,
+    "scores": {fingerprint_id: 40},
+    "margin": 15,
+    "outcome": "punched",
+    "punch_id": uuid4(),
+    "retry_message": "m",
+    "probe": b"probe",
+    "image": b"image",
+    "image_width": 160,
+    "image_height": 120,
+    "received_at": T,
+    "db_login": "clock",
+  }
+  scan = FingerprintScan.model_validate(data)
+  assert (scan.result, scan.outcome, scan.best_finger) == (ScanResult.MATCHED, ScanOutcome.PUNCHED, Finger.LEFT_INDEX)
+  assert scan.image is not None and scan.image.get_secret_value() == b"image"
+  assert scan.scores == {fingerprint_id: 40}
+  assert FingerprintScan.model_validate(scan.model_dump()) == scan
