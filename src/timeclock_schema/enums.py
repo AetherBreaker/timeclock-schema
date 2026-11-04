@@ -82,3 +82,24 @@ class FingerprintChangeAction(StrEnum):
   ADD = "add"
   REPLACE = "replace"
   REMOVE = "remove"
+
+
+class ScanResult(StrEnum):
+  """`scan_result`: what matching a scan came to."""
+
+  MATCHED = "matched"
+  NO_MATCH = "no_match"
+  TOO_CLOSE = "too_close"
+  """The best score beat another employee's by less than the match margin."""
+  RETRY = "retry"
+  """The reader asked for another scan (`retry_message` says why)."""
+
+
+class ScanOutcome(StrEnum):
+  """`scan_outcome`: what became of a scan afterwards."""
+
+  PUNCHED = "punched"
+  CANCELLED = "cancelled"
+  TIMED_OUT = "timed_out"
+  RESCANNED = "rescanned"
+  OTHER = "other"
