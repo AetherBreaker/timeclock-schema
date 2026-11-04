@@ -44,7 +44,7 @@ from timeclock_schema.models import (
   RuleRow,
   Settings,
 )
-from timeclock_schema.shifts import total_hours, week_bounds
+from timeclock_schema.shifts import apply_corrections, build_timeline, total_hours, week_bounds
 from timeclock_schema.wire import NOTIFY_CHANNEL, Notification, NotifyTable
 
 if TYPE_CHECKING:
@@ -419,9 +419,12 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
       assert row is not None
       now = row[0]
       got = {(r[0], r[1]): (r[2], r[3]) for r in c.execute("SELECT employee_id, week_of, hours, breaks FROM weekly_hours")}
+    log = c.execute("SELECT employee_id, id, kind::text, at FROM punch_log").fetchall()
     with c.cursor(row_factory=dict_row) as cur:
       settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
       expected = {}
+      expected_log = []
+      left_out = []
       for employee_id in (ann, bob):
         punches = [Punch.model_validate(r) for r in cur.execute("SELECT * FROM punches WHERE employee_id = %s", (employee_id,))]
         corrections = [
@@ -430,6 +433,12 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
             "SELECT pc.* FROM punch_corrections pc JOIN punches p ON p.id = pc.punch_id WHERE p.employee_id = %s", (employee_id,)
           )
         ]
+        # punch_log holds the punches the timeline counts: every corrected one but its anomalies.
+        anomalies = build_timeline(punches, corrections).anomalies
+        ignored = {a.punch.id for a in anomalies}
+        left_out += [a.punch.at for a in anomalies]
+        effective = apply_corrections(punches, corrections)
+        expected_log += [(employee_id, e.id, e.kind.value, e.at) for e in effective if e.id not in ignored]
         start, end = week_bounds(min(p.at for p in punches), NY)
         while start < now:
           t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
@@ -438,6 +447,8 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
           start, end = week_bounds(end, NY)
   assert got == expected
   assert (ann, date(2026, 10, 19)) in got and (ann, date(2026, 10, 26)) in got
+  assert sorted(log, key=lambda r: r[0]) == expected_log  # a stable sort keeps each employee's log in time order
+  assert left_out == [_ny(21, 9, 5), _ny(21, 9, 30)]  # Ann's repeated clock-in and stray break end
 
 
 def test_new_employee_names_are_capitalized_unless_typed_mixed(fresh_db: str):
