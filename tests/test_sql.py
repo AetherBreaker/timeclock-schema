@@ -373,14 +373,25 @@ def test_weekly_hours_formats_one_row_per_employee_for_the_week(fresh_db: str):
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'weekly_hours' ORDER BY ordinal_position"
       )
     ]
+    days = c.execute(
+      "SELECT day, hours, breaks, lunches, unpaid_breaks FROM daily_hours WHERE employee_id = %s AND day < '2026-10-26'", (ann,)
+    ).fetchall()
   assert rows == [("Ann Lee", "14:55", "0:30", "0:30", "0:10"), ("Bob Lee", "0:05", "0:00", "0:00", "0:00")]
   assert columns == ["employee_id", "employee_name", "week_of", "hours", "breaks", "lunches", "unpaid_breaks"]
+  assert days == [(date(2026, 10, 20), "8:00", "0:00", "0:00", "0:00"), (date(2026, 10, 19), "6:55", "0:30", "0:30", "0:10")]
 
 
-def test_weekly_hours_matches_total_hours(fresh_db: str):
-  # The view repeats total_hours's rules; each week's totals must be the same. Covered: the daily allowance spent across
-  # two breaks, lunch, a repeated clock-in and a stray break end, a void and an amend, a shift and a break across Monday
-  # 00:00, a shift across the end of DST, and a shift still open, on a break, with an automatic clock-out stamped later.
+def _day_bounds(at: datetime, tz: ZoneInfo) -> tuple[datetime, datetime]:
+  day = at.astimezone(tz).date()
+  return datetime.combine(day, time(0), tzinfo=tz).astimezone(UTC), datetime.combine(
+    day + timedelta(days=1), time(0), tzinfo=tz
+  ).astimezone(UTC)
+
+
+def test_hours_views_match_total_hours(fresh_db: str):
+  # The views repeat total_hours's rules; each week's and day's totals must be the same. Covered: the daily allowance spent
+  # across two breaks, lunch, a repeated clock-in and a stray break end, a void and an amend, a shift and a break across
+  # Monday 00:00, a shift across the end of DST, and a shift still open, on a break, with an automatic clock-out stamped later.
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
     ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
@@ -421,13 +432,21 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
       assert row is not None
       now = row[0]
       got = {
-        (r[0], r[1]): r[2:] for r in c.execute("SELECT employee_id, week_of, hours, breaks, lunches, unpaid_breaks FROM weekly_hours")
+        view: {
+          (r[0], r[1]): r[2:]
+          for r in c.execute(
+            sql.SQL("SELECT employee_id, {}, hours, breaks, lunches, unpaid_breaks FROM {}").format(
+              sql.Identifier(column), sql.Identifier(view)
+            )
+          )
+        }
+        for view, column in (("weekly_hours", "week_of"), ("daily_hours", "day"))
       }
     log = c.execute("SELECT employee_id, id, kind::text, at FROM punch_log").fetchall()
     with c.cursor(row_factory=dict_row) as cur:
       settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
       all_paid = settings.model_copy(update={"paid_break_minutes": 24 * 60})
-      expected = {}
+      expected = {"weekly_hours": {}, "daily_hours": {}}
       expected_log = []
       left_out = []
       for employee_id in (ann, bob):
@@ -444,21 +463,23 @@ def test_weekly_hours_matches_total_hours(fresh_db: str):
         left_out += [a.punch.at for a in anomalies]
         effective = apply_corrections(punches, corrections)
         expected_log += [(employee_id, e.id, e.kind.value, e.at) for e in effective if e.id not in ignored]
-        start, end = week_bounds(min(p.at for p in punches), NY)
-        while start < now:
-          t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
-          # total_hours's unpaid is lunch plus unpaid break; with every break paid, it's lunch alone.
-          lunch = total_hours(punches, corrections, settings=all_paid, tz=NY, start=start, end=end, now=now).unpaid
-          if t.worked + t.paid_break + t.unpaid > timedelta():  # any shift time that week
-            expected[employee_id, start.astimezone(NY).date()] = (
-              _hm(t.worked),
-              _hm(t.paid_break),
-              _hm(lunch),
-              _hm(t.unpaid - lunch),
-            )
-          start, end = week_bounds(end, NY)
+        for view, bounds in (("weekly_hours", week_bounds), ("daily_hours", _day_bounds)):
+          start, end = bounds(min(p.at for p in punches), NY)
+          while start < now:
+            t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
+            # total_hours's unpaid is lunch plus unpaid break; with every break paid, it's lunch alone.
+            lunch = total_hours(punches, corrections, settings=all_paid, tz=NY, start=start, end=end, now=now).unpaid
+            if t.worked + t.paid_break + t.unpaid > timedelta():  # any shift time in the period
+              expected[view][employee_id, start.astimezone(NY).date()] = (
+                _hm(t.worked),
+                _hm(t.paid_break),
+                _hm(lunch),
+                _hm(t.unpaid - lunch),
+              )
+            start, end = bounds(end, NY)
   assert got == expected
-  assert (ann, date(2026, 10, 19)) in got and (ann, date(2026, 10, 26)) in got
+  assert (ann, date(2026, 10, 19)) in got["weekly_hours"] and (ann, date(2026, 10, 26)) in got["weekly_hours"]
+  assert {(ann, date(2026, 10, 25)), (ann, date(2026, 10, 26)), (ann, date(2026, 11, 1))} <= got["daily_hours"].keys()
   assert sorted(log, key=lambda r: r[0]) == expected_log  # a stable sort keeps each employee's log in time order
   assert left_out == [_ny(21, 9, 5), _ny(21, 9, 30)]  # Ann's repeated clock-in and stray break end
 
