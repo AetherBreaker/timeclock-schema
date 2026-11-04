@@ -442,11 +442,15 @@ def test_hours_views_match_total_hours(fresh_db: str):
         }
         for view, column in (("weekly_hours", "week_of"), ("daily_hours", "day"))
       }
+      got["shift_summary"] = {
+        (r[0], r[1]): r[2:]
+        for r in c.execute("SELECT employee_id, clock_in, hours, breaks, lunches, unpaid_breaks FROM shift_summary")
+      }
     log = c.execute("SELECT employee_id, id, kind::text, at FROM punch_log").fetchall()
     with c.cursor(row_factory=dict_row) as cur:
       settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
       all_paid = settings.model_copy(update={"paid_break_minutes": 24 * 60})
-      expected = {"weekly_hours": {}, "daily_hours": {}}
+      expected = {"weekly_hours": {}, "daily_hours": {}, "shift_summary": {}}
       expected_log = []
       left_out = []
       for employee_id in (ann, bob):
@@ -477,11 +481,84 @@ def test_hours_views_match_total_hours(fresh_db: str):
                 _hm(t.unpaid - lunch),
               )
             start, end = bounds(end, NY)
+        # A shift's totals are total_hours over its own span, which no other shift overlaps.
+        for shift in build_timeline(punches, corrections, as_of=now).shifts:
+          start, end = shift.clock_in.at, now if shift.clock_out is None else shift.clock_out.at
+          t = total_hours(punches, corrections, settings=settings, tz=NY, start=start, end=end, now=now)
+          lunch = total_hours(punches, corrections, settings=all_paid, tz=NY, start=start, end=end, now=now).unpaid
+          expected["shift_summary"][employee_id, start] = (_hm(t.worked), _hm(t.paid_break), _hm(lunch), _hm(t.unpaid - lunch))
   assert got == expected
   assert (ann, date(2026, 10, 19)) in got["weekly_hours"] and (ann, date(2026, 10, 26)) in got["weekly_hours"]
   assert {(ann, date(2026, 10, 25)), (ann, date(2026, 10, 26)), (ann, date(2026, 11, 1))} <= got["daily_hours"].keys()
   assert sorted(log, key=lambda r: r[0]) == expected_log  # a stable sort keeps each employee's log in time order
   assert left_out == [_ny(21, 9, 5), _ny(21, 9, 30)]  # Ann's repeated clock-in and stray break end
+
+
+def test_shift_summary_breaks_down_each_shift(fresh_db: str, clock_login: str):
+  # Monday, from the warehouse clock: a 17:30 break (+2 over 15), a lunch, a 15:59 break (not over), and the backend's
+  # automatic clock-out; 33:29 of break, 30:00 paid. Tuesday: a clock-out the owner amended from 9:30 to 10:00.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+    ann = _add_employee(c)
+  with psycopg.connect(clock_login, autocommit=True) as clock:
+    ids = {}
+    for kind, at in [
+      ("clock_in", _ny(19, 9)),
+      ("break_start", _ny(19, 10)),
+      ("break_end", _ny(19, 10, 17, 30)),
+      ("lunch_start", _ny(19, 12)),
+      ("lunch_end", _ny(19, 12, 30)),
+      ("break_start", _ny(19, 15)),
+      ("break_end", _ny(19, 15, 15, 59)),
+      ("clock_in", _ny(20, 9)),
+      ("clock_out", _ny(20, 9, 30)),
+    ]:
+      ids[kind, at] = uuid4()
+      clock.execute(
+        "INSERT INTO punches (id, employee_id, kind, at, instance_id) VALUES (%s, %s, %s, %s, 'main-warehouse')",
+        (ids[kind, at], ann, kind, at),
+      )
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute(
+      "INSERT INTO punches (id, employee_id, kind, at, instance_id, automatic) VALUES (%s, %s, 'clock_out', %s, 'backend', true)",
+      (uuid4(), ann, _ny(19, 17)),
+    )
+    c.execute(
+      "INSERT INTO punch_corrections (punch_id, action, new_at) VALUES (%s, 'amend', %s)",
+      (ids["clock_out", _ny(20, 9, 30)], _ny(20, 10)),
+    )
+    rows = c.execute(
+      "SELECT day, week_of, clock, clock_in, clock_out, automatic_clock_out, corrected, shift_length, hours, breaks,"
+      " unpaid_breaks, lunches, break_count, lunch_count, breaks_over_limit, break_overage, break_times, lunch_times"
+      " FROM shift_summary"
+    ).fetchall()
+  monday, tuesday = date(2026, 10, 19), date(2026, 10, 20)
+  assert rows == [
+    (
+      tuesday,
+      monday,
+      "main-warehouse",
+      _ny(20, 9),
+      _ny(20, 10),
+      False,
+      True,
+      "1:00",
+      "1:00",
+      "0:00",
+      "0:00",
+      "0:00",
+      0,
+      0,
+      0,
+      "0:00",
+      "",
+      "",
+    ),
+    (
+      *(monday, monday, "main-warehouse", _ny(19, 9), _ny(19, 17), True, False),
+      *("8:00", "6:56", "0:30", "0:03", "0:30", 2, 1, 1, "0:02", "10:00-10:17 (+2), 15:00-15:15", "12:00-12:30"),
+    ),
+  ]
 
 
 def test_new_employee_names_are_capitalized_unless_typed_mixed(fresh_db: str):
