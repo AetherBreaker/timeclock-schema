@@ -257,6 +257,26 @@ class Settings(TimeclockModel):
   """Whether the clocks store each scan's image in `fingerprint_scans`."""
   fingerprint_match_margin: Annotated[int, Field(ge=0)] = 15
   """How far the best score must beat the best of a different employee's to count as a match."""
+  registration_min_detail_points: Annotated[int, Field(ge=0)] = 20
+  """Registration: the fewest detail points a press may have (a light or partial press has fewer)."""
+  registration_max_detail_points: Annotated[int, Field(ge=0)] = 120
+  """Registration: the most detail points a press may have (a smudged or noisy press has more); at least the fewest."""
+  registration_centre_tolerance: Annotated[int, Field(ge=0)] = 100
+  """Registration: how far in pixels a press's detail points' centroid may sit from the reader window's centre."""
+  registration_agreement_bar: Annotated[int, Field(ge=0)] = 41
+  """Registration: the score against another press of the same registration at which a press agrees with it."""
+  registration_agreement_needed: Annotated[int, Field(ge=0, le=4)] = 1
+  """Registration: how many of the other 4 kept presses each press must agree with."""
+  registration_resemblance_bar: Annotated[int, Field(ge=0)] = 40
+  """Registration: the score against another person's press at which a new press resembles it."""
+  registration_extra_presses: Annotated[int, Field(ge=0)] = 5
+  """Registration: how many failing presses may be replaced before it gives up."""
+
+  @model_validator(mode="after")
+  def _check_detail_points(self) -> Self:
+    if self.registration_max_detail_points < self.registration_min_detail_points:
+      raise ValueError("registration_max_detail_points must be at least registration_min_detail_points")
+    return self
 
 
 class AutoClockOutRun(TimeclockModel):

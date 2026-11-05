@@ -237,6 +237,37 @@ def test_settings_scan_defaults():
     Settings(fingerprint_match_margin=-1)
 
 
+def test_settings_registration_defaults():
+  s = Settings()
+  assert (
+    s.registration_min_detail_points,
+    s.registration_max_detail_points,
+    s.registration_centre_tolerance,
+    s.registration_agreement_bar,
+    s.registration_agreement_needed,
+    s.registration_resemblance_bar,
+    s.registration_extra_presses,
+  ) == (20, 120, 100, 41, 1, 40, 5)
+
+
+@pytest.mark.parametrize(
+  "values",
+  [
+    {"registration_min_detail_points": -1},
+    {"registration_min_detail_points": 50, "registration_max_detail_points": 49},
+    {"registration_centre_tolerance": -1},
+    {"registration_agreement_bar": -1},
+    {"registration_agreement_needed": -1},
+    {"registration_agreement_needed": 5},
+    {"registration_resemblance_bar": -1},
+    {"registration_extra_presses": -1},
+  ],
+)
+def test_settings_registration_bounds(values: dict[str, int]):
+  with pytest.raises(ValidationError):
+    Settings.model_validate(values)
+
+
 def test_fingerprint_scan_round_trips():
   fingerprint_id = uuid4()
   data = {

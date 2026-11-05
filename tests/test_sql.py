@@ -1153,6 +1153,28 @@ def test_settings_default_the_scan_switches(fresh_db: str):
       c.execute("UPDATE config.settings SET fingerprint_match_margin = -1")
 
 
+def test_settings_default_the_registration_bars(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    row = c.execute(
+      "SELECT registration_min_detail_points, registration_max_detail_points, registration_centre_tolerance,"
+      " registration_agreement_bar, registration_agreement_needed, registration_resemblance_bar, registration_extra_presses"
+      " FROM config.settings"
+    ).fetchone()
+    assert row == (20, 120, 100, 41, 1, 40, 5)
+    for update in (
+      "UPDATE config.settings SET registration_min_detail_points = -1",
+      "UPDATE config.settings SET registration_max_detail_points = 19",
+      "UPDATE config.settings SET registration_centre_tolerance = -1",
+      "UPDATE config.settings SET registration_agreement_bar = -1",
+      "UPDATE config.settings SET registration_agreement_needed = -1",
+      "UPDATE config.settings SET registration_agreement_needed = 5",
+      "UPDATE config.settings SET registration_resemblance_bar = -1",
+      "UPDATE config.settings SET registration_extra_presses = -1",
+    ):
+      with pytest.raises(errors.CheckViolation):
+        c.execute(update)
+
+
 _SCAN_COLUMNS = (
   "id, at, instance_id, result, best_fingerprint_id, best_employee_id, best_finger, best_score, other_fingerprint_id,"
   " other_employee_id, other_finger, other_score, scores, margin, outcome, punch_id, retry_message, probe, image,"
