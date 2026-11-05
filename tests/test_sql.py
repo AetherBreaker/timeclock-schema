@@ -1426,7 +1426,7 @@ def _as_badge(web_login: str, email: str) -> Iterator[psycopg.Connection]:
     yield c
 
 
-_PAGE_PUNCH: LiteralString = "INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%s, 'clock_in', %s, 'page')"
+_PAGE_PUNCH: LiteralString = "INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%s, 'clock_in', %s, 'web')"
 _OWN = "you can't change your own punches"
 
 
@@ -1442,7 +1442,7 @@ def test_badge_adds_a_save_a_punch_and_a_correction(fresh_db: str, web_login: st
     edit_id, login = row
     assert login == email
     c.execute(
-      "INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) VALUES (%s, 'clock_out', %s, 'page', %s)",
+      "INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) VALUES (%s, 'clock_out', %s, 'web', %s)",
       (other_id, T + timedelta(hours=8), edit_id),
     )
     c.execute(
@@ -1519,9 +1519,9 @@ def test_badge_cannot_rewrite_history(fresh_db: str, web_login: str, make_editor
     ("DELETE FROM punches", None),
     ("UPDATE punch_corrections SET note = 'x'", None),
     ("DELETE FROM punch_corrections", None),
-    ("INSERT INTO punches (employee_id, kind, at, instance_id, db_login) VALUES (%s, 'clock_in', %s, 'page', 'x')", (employee_id, T)),
+    ("INSERT INTO punches (employee_id, kind, at, instance_id, db_login) VALUES (%s, 'clock_in', %s, 'web', 'x')", (employee_id, T)),
     (
-      "INSERT INTO punches (employee_id, kind, at, instance_id, automatic) VALUES (%s, 'clock_in', %s, 'page', true)",
+      "INSERT INTO punches (employee_id, kind, at, instance_id, automatic) VALUES (%s, 'clock_in', %s, 'web', true)",
       (employee_id, T),
     ),
     ("INSERT INTO punch_corrections (punch_id, action, db_login) VALUES (%s, 'void', 'x')", (punch_id,)),
@@ -1658,3 +1658,45 @@ def test_badge_can_make_an_admin_and_cannot_touch_other_columns(fresh_db: str, w
     for statement, params in forbidden:
       with pytest.raises(errors.InsufficientPrivilege), c.transaction():
         c.execute(statement, params)
+
+
+def test_page_added_punch_shows_its_note_and_counts_as_corrected(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c, c.transaction():
+    row = c.execute("INSERT INTO edits (note) VALUES ('forgot to clock in') RETURNING id, recorded_at").fetchone()
+    assert row is not None
+    edit_id, saved_at = row
+    for kind, at in [("clock_in", T - timedelta(hours=8)), ("clock_out", T)]:
+      c.execute(
+        "INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) VALUES (%s, %s, %s, 'web', %s)",
+        (employee_id, kind, at, edit_id),
+      )
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT kind::text, correction_note, corrected_at FROM punch_log").fetchall() == [
+      ("clock_in", "forgot to clock in", saved_at),
+      ("clock_out", "forgot to clock in", saved_at),
+    ]
+    assert admin.execute("SELECT corrected FROM shift_summary").fetchall() == [(True,)]
+
+
+def test_correction_note_still_wins_over_the_save(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c, c.transaction():
+    row = c.execute("INSERT INTO edits (note) VALUES ('forgot to clock in') RETURNING id").fetchone()
+    assert row is not None
+    row = c.execute(
+      "INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) VALUES (%s, 'clock_in', %s, 'web', %s) RETURNING id",
+      (employee_id, T, row[0]),
+    ).fetchone()
+    assert row is not None
+    punch_id = row[0]
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    row = admin.execute(
+      "INSERT INTO punch_corrections (punch_id, action, new_at, note) VALUES (%s, 'amend', %s, 'typo') RETURNING recorded_at",
+      (punch_id, T - timedelta(hours=1)),
+    ).fetchone()
+    assert row is not None
+    assert admin.execute("SELECT correction_note, corrected_at FROM punch_log").fetchall() == [("typo", row[0])]
