@@ -24,6 +24,11 @@ def test_second_migration_labels_fingers():
   assert (second.version, second.name) == (2, "fingerprint_fingers")
 
 
+def test_editors_migration_is_fourteenth():
+  editors = load_migrations()[13]
+  assert (editors.version, editors.name) == (14, "editors")
+
+
 def test_versions_are_contiguous():
   assert [m.version for m in load_migrations()] == list(range(1, len(load_migrations()) + 1))
 

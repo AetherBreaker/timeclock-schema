@@ -49,7 +49,7 @@ from timeclock_schema.wire import NOTIFY_CHANNEL, Notification, NotifyTable
 
 if TYPE_CHECKING:
   # Standard library imports
-  from collections.abc import Generator, Iterator
+  from collections.abc import Callable, Generator, Iterator
 
   # First party imports
   from timeclock_schema.base import TimeclockModel
@@ -101,6 +101,44 @@ def clock_login(admin_dsn: str, fresh_db: str) -> Iterator[str]:
   finally:
     with psycopg.connect(admin_dsn, autocommit=True) as admin:
       admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+@pytest.fixture
+def web_login(admin_dsn: str, fresh_db: str) -> str:
+  # The migration creates timeclock_web NOLOGIN; the backend gives it LOGIN and a password. Server-wide, so left as is.
+  with psycopg.connect(admin_dsn, autocommit=True) as admin:
+    admin.execute("ALTER ROLE timeclock_web LOGIN PASSWORD 'pw'")
+  return make_conninfo(fresh_db, user="timeclock_web", password="pw")
+
+
+def _new_email() -> str:
+  return f"ed-{uuid4().hex[:12]}@example.com"
+
+
+@pytest.fixture
+def make_editor(admin_dsn: str, fresh_db: str) -> Iterator[Callable[..., str]]:
+  """Adds `backend.editors` rows; badges are server-wide and outlive the dropped database, so teardown drops them."""
+  emails: list[str] = []
+
+  def make(employee_id: int | None = None, *, developer: bool = False) -> str:
+    email = _new_email()
+    with psycopg.connect(fresh_db, autocommit=True) as c:
+      c.execute("INSERT INTO backend.editors (email, employee_id, developer) VALUES (%s, %s, %s)", (email, employee_id, developer))
+    emails.append(email)
+    return email
+
+  try:
+    yield make
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      for email in emails:
+        admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(email)))
+
+
+def _role_exists(c: psycopg.Connection, role: str) -> bool:
+  row = c.execute("SELECT count(*) FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
+  assert row is not None
+  return row[0] == 1
 
 
 def _add_employee(c: psycopg.Connection, first_name: str = "Ann", pin_username: str = "12") -> int:
@@ -1285,3 +1323,95 @@ def test_an_insert_skips_the_prune_while_another_runs_it(fresh_db: str, clock_lo
     pruning.rollback()
     c.execute(_INSERT_SCAN_WITH_DATA, (uuid4(), now))
     assert pruning.execute(_CLEARED, (old,)).fetchone() == (True,)
+
+
+# The shift corrections page (spec 2026-11-05): the editors allowlist and each account's database role, its "badge".
+
+
+def test_editor_row_creates_a_badge_the_page_can_become(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  email = make_editor()
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute(
+      "SELECT rolcanlogin, pg_has_role(%s, 'timeclock_editor_access', 'USAGE') FROM pg_roles WHERE rolname = %s", (email, email)
+    ).fetchone() == (False, True)
+  with psycopg.connect(web_login, autocommit=True) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(email)))
+    assert c.execute("SELECT current_user::text, session_user::text").fetchone() == (email, "timeclock_web")
+
+
+def test_page_login_has_no_privileges_of_its_own(web_login: str, make_editor: Callable[..., str]):
+  make_editor()
+  with psycopg.connect(web_login, autocommit=True) as c:
+    statements: list[LiteralString] = [
+      "SELECT * FROM punches",
+      "SELECT * FROM employees",
+      "SELECT * FROM backend.editors",
+      "SET ROLE timeclock_editor_access",
+    ]
+    for statement in statements:
+      with pytest.raises(errors.InsufficientPrivilege):
+        c.execute(statement)
+
+
+def test_badge_cannot_become_the_group_role(web_login: str, make_editor: Callable[..., str]):
+  email = make_editor()
+  with psycopg.connect(web_login, autocommit=True) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(email)))
+    with pytest.raises(errors.InsufficientPrivilege):
+      c.execute("SET ROLE timeclock_editor_access")
+
+
+def test_deleting_the_row_drops_the_badge_and_readding_restores_it(fresh_db: str, make_editor: Callable[..., str]):
+  email = make_editor()
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("DELETE FROM backend.editors WHERE email = %s", (email,))
+    assert not _role_exists(c, email)
+    c.execute("INSERT INTO backend.editors (email) VALUES (%s)", (email,))
+    assert _role_exists(c, email)
+
+
+def test_changing_the_email_moves_the_badge(fresh_db: str, admin_dsn: str, make_editor: Callable[..., str]):
+  email, moved = make_editor(), _new_email()
+  try:
+    with psycopg.connect(fresh_db, autocommit=True) as c:
+      c.execute("UPDATE backend.editors SET email = %s WHERE email = %s", (moved, email))
+      assert not _role_exists(c, email)
+      assert _role_exists(c, moved)
+      assert c.execute("SELECT pg_has_role('timeclock_web', %s, 'SET')", (moved,)).fetchone() == (True,)
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(moved)))
+
+
+def test_test_database_allowlist_touches_no_roles(fresh_db: str, make_editor: Callable[..., str]):
+  email = make_editor()  # made while the database counts as production, so the badge exists
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.deployment (production) VALUES (false)")
+    c.execute("DELETE FROM backend.editors WHERE email = %s", (email,))
+    assert _role_exists(c, email)
+    other = _new_email()
+    c.execute("INSERT INTO backend.editors (email) VALUES (%s)", (other,))
+    assert not _role_exists(c, other)
+
+
+@pytest.mark.parametrize("email", ["Pat@example.com", "not-an-email", "a" * 52 + "@example.com"])  # the last is 64 bytes
+def test_editor_email_checks(fresh_db: str, email: str):
+  with psycopg.connect(fresh_db) as c, pytest.raises(errors.CheckViolation):
+    c.execute("INSERT INTO backend.editors (email) VALUES (%s)", (email,))
+
+
+def test_editor_account_looks_up_any_case(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  email = make_editor(employee_id, developer=True)
+  with psycopg.connect(web_login) as c:
+    assert c.execute("SELECT * FROM backend.editor_account(%s)", (email.upper(),)).fetchall() == [(employee_id, True)]
+    assert c.execute("SELECT * FROM backend.editor_account('nobody@example.com')").fetchall() == []
+
+
+def test_only_the_page_login_may_look_up_editors(fresh_db: str):
+  with psycopg.connect(fresh_db) as c:
+    may = "SELECT has_function_privilege(%s, 'backend.editor_account(text)', 'EXECUTE')"
+    assert c.execute(may, ("timeclock_web",)).fetchone() == (True,)
+    assert c.execute(may, ("timeclock_editor_access",)).fetchone() == (False,)
+    assert c.execute(may, ("timeclock_clock_access",)).fetchone() == (False,)
