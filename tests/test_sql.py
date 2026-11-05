@@ -34,7 +34,10 @@ from timeclock_schema.models import (
   PHONE_PATTERN,
   AutoClockOutRun,
   BusinessHours,
+  Edit,
+  Editor,
   Employee,
+  EmployeeChange,
   Fingerprint,
   FingerprintBypass,
   FingerprintChange,
@@ -906,11 +909,17 @@ def test_0002_refuses_existing_prints(admin_dsn: str):
       admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
-def test_every_table_loads_into_its_model(fresh_db: str):
+def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[..., str]):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO groups (name) VALUES ('night')")
     employee_id, manager_id = _add_employee(c), _add_employee(c, "Bob", "34")
     punch_id = _add_punch(c, employee_id)
+    row = c.execute("INSERT INTO edits (note) VALUES ('n') RETURNING id").fetchone()
+    assert row is not None
+    edit_id = row[0]
+    c.execute("UPDATE punches SET edit_id = %s WHERE id = %s", (edit_id, punch_id))
+    c.execute("UPDATE employees SET last_name = 'Park' WHERE id = %s", (employee_id,))
+    make_editor(employee_id)
     c.execute(
       "INSERT INTO fingerprints (id, employee_id, finger, template, registered_at, instance_id) VALUES (%s, %s, 'left_index', %s, %s, '1')",
       (uuid4(), employee_id, b"tmpl", T),
@@ -945,6 +954,9 @@ def test_every_table_loads_into_its_model(fresh_db: str):
       ("config.business_hours", BusinessHours),
       ("config.settings", Settings),
       ("backend.auto_clock_out_runs", AutoClockOutRun),
+      ("edits", Edit),
+      ("employee_changes", EmployeeChange),
+      ("backend.editors", Editor),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -960,10 +972,16 @@ def test_every_table_loads_into_its_model(fresh_db: str):
     "config.business_hours": 1,
     "config.settings": 1,
     "backend.auto_clock_out_runs": 7,
+    "edits": 1,
+    "employee_changes": 1,
+    "backend.editors": 1,
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
   assert loaded["fingerprints"][0].model_dump()["template"].get_secret_value() == b"tmpl"
+  assert loaded["punches"][0].model_dump()["edit_id"] == edit_id
+  assert loaded["punch_corrections"][0].model_dump()["db_login"] == conninfo_to_dict(fresh_db)["user"]
+  assert loaded["employee_changes"][0].model_dump()["field"] == "last_name"
 
 
 def test_run_row_checks(fresh_db: str):
@@ -1418,7 +1436,7 @@ def test_only_the_page_login_may_look_up_editors(fresh_db: str):
 
 
 @contextmanager
-def _as_badge(web_login: str, email: str) -> Iterator[psycopg.Connection]:
+def _as_badge(web_login: str, email: str) -> Generator[psycopg.Connection]:
   """The page's connection: timeclock_web acting as the account's badge. Not autocommit; write in `c.transaction()`."""
   with psycopg.connect(web_login) as c:
     c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(email)))
