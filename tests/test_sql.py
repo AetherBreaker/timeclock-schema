@@ -1550,3 +1550,111 @@ def test_clocks_and_owner_still_stamp_their_own_logins(fresh_db: str, clock_logi
       conninfo_to_dict(clock_login)["user"],
       conninfo_to_dict(fresh_db)["user"],
     )
+
+
+_OWN_SETTINGS = "you can't change your own role, group, fingerprint exemption or active status"
+
+
+def test_employee_update_logs_each_changed_field(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    admin.execute("INSERT INTO groups (name) VALUES ('night')")  # id 2
+  email = make_editor(None)
+  with _as_badge(web_login, email) as c, c.transaction():
+    row = c.execute("INSERT INTO edits (note) VALUES ('moved') RETURNING id").fetchone()
+    assert row is not None
+    (edit_id,) = row
+    c.execute("SELECT set_config('timeclock.edit_id', %s, true)", (str(edit_id),))
+    c.execute("UPDATE employees SET group_id = 2, email = 'a@example.com' WHERE id = %s", (employee_id,))
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT field, old_value, new_value, edit_id, db_login FROM employee_changes ORDER BY field").fetchall() == [
+      ("email", None, "a@example.com", edit_id, email),
+      ("group_id", "1", "2", edit_id, email),
+    ]
+
+
+def test_pin_change_is_logged_without_the_hash(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    row = admin.execute("SELECT crypt('5678', gen_salt('bf'))").fetchone()
+    assert row is not None
+    (pin_hash,) = row
+  with _as_badge(web_login, make_editor(None)) as c, c.transaction():
+    c.execute("UPDATE employees SET pin_hash = %s WHERE id = %s", (pin_hash, employee_id))
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT field, old_value, new_value FROM employee_changes").fetchall() == [("pin", None, None)]
+
+
+def test_owner_edits_are_logged_too(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    admin.execute("UPDATE employees SET last_name = 'Park' WHERE id = %s", (employee_id,))
+    assert admin.execute("SELECT field, old_value, new_value, edit_id, db_login FROM employee_changes").fetchall() == [
+      ("last_name", "Lee", "Park", None, conninfo_to_dict(fresh_db)["user"])
+    ]
+
+
+def test_renumbering_an_employee_carries_their_log(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    admin.execute("UPDATE employees SET last_name = 'Park' WHERE id = %s", (employee_id,))
+    admin.execute("UPDATE employees SET id = 9001, first_name = 'Annie' WHERE id = %s", (employee_id,))
+    assert admin.execute("SELECT employee_id, field FROM employee_changes ORDER BY field").fetchall() == [
+      (9001, "first_name"),
+      (9001, "last_name"),
+    ]
+
+
+def test_editor_changes_own_name_contact_and_pin_but_not_the_rest(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    own_id = _add_employee(admin)
+    other_id = _add_employee(admin, "Bob", "34")
+    admin.execute("INSERT INTO groups (name) VALUES ('night')")  # id 2
+    row = admin.execute("SELECT crypt('5678', gen_salt('bf'))").fetchone()
+    assert row is not None
+    (pin_hash,) = row
+  settings: list[LiteralString] = [
+    "UPDATE employees SET role = 'admin' WHERE id = %s",
+    "UPDATE employees SET group_id = 2 WHERE id = %s",
+    "UPDATE employees SET fingerprint_exempt = true WHERE id = %s",
+    "UPDATE employees SET active = false WHERE id = %s",
+  ]
+  with _as_badge(web_login, make_editor(own_id)) as c:
+    with c.transaction():
+      c.execute("UPDATE employees SET first_name = 'Annie', middle_name = 'May', last_name = 'Park' WHERE id = %s", (own_id,))
+      c.execute("UPDATE employees SET phone = '+15555550123', email = 'ann@example.com' WHERE id = %s", (own_id,))
+      c.execute("UPDATE employees SET pin_hash = %s WHERE id = %s", (pin_hash, own_id))
+    for statement in settings:
+      with pytest.raises(errors.InsufficientPrivilege, match=_OWN_SETTINGS), c.transaction():
+        c.execute(statement, (own_id,))
+      with c.transaction():
+        c.execute(statement, (other_id,))
+
+
+def test_removed_editor_cannot_edit_employees(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  email = make_editor(None)
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    admin.execute("ALTER TABLE backend.editors DISABLE TRIGGER editors_badge")  # keeps the badge, as in the punch test
+    admin.execute("DELETE FROM backend.editors WHERE email = %s", (email,))
+  with _as_badge(web_login, email) as c, pytest.raises(errors.InsufficientPrivilege, match="not on the allowlist"), c.transaction():
+    c.execute("UPDATE employees SET first_name = 'Annie' WHERE id = %s", (employee_id,))
+
+
+def test_badge_can_make_an_admin_and_cannot_touch_other_columns(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  forbidden: list[tuple[LiteralString, tuple[object, ...] | None]] = [
+    ("UPDATE employees SET pin_username = '9' WHERE id = %s", (employee_id,)),
+    ("UPDATE employees SET id = 99 WHERE id = %s", (employee_id,)),
+    ("DELETE FROM employees WHERE id = %s", (employee_id,)),
+    ("INSERT INTO employee_changes (employee_id, field, db_login) VALUES (%s, 'role', 'x')", (employee_id,)),
+    ("UPDATE employee_changes SET field = 'x'", None),
+    ("DELETE FROM employee_changes", None),
+  ]
+  with _as_badge(web_login, make_editor(None)) as c:
+    with c.transaction():
+      c.execute("UPDATE employees SET role = 'admin' WHERE id = %s", (employee_id,))
+    for statement, params in forbidden:
+      with pytest.raises(errors.InsufficientPrivilege), c.transaction():
+        c.execute(statement, params)
