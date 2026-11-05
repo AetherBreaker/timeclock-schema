@@ -140,6 +140,7 @@ class Punch(TimeclockModel):
   automatic: bool = False
   received_at: UtcDatetime | None = None
   db_login: str | None = None
+  edit_id: UUID | None = None  # the page save that added it
 
 
 class PunchCorrection(TimeclockModel):
@@ -152,6 +153,8 @@ class PunchCorrection(TimeclockModel):
   new_kind: PunchKind | None = None
   note: str = ""
   recorded_at: UtcDatetime
+  db_login: str | None = None
+  edit_id: UUID | None = None  # the page save that wrote it
 
   @model_validator(mode="after")
   def _check_new_values(self) -> Self:
@@ -203,6 +206,36 @@ class FingerprintBypass(TimeclockModel):
     if not self.reason.is_override and (self.manager_id is not None or self.pin_only is not None):
       raise ValueError("a PIN login names no manager and no pin_only")
     return self
+
+
+class Edit(TimeclockModel):
+  """`edits` row: one save from the shift corrections page, with its note."""
+
+  id: UUID
+  note: str = ""
+  db_login: str | None = None
+  recorded_at: UtcDatetime
+
+
+class EmployeeChange(TimeclockModel):
+  """`employee_changes` row: one changed employee column, from any login; a PIN change is field "pin" with no values."""
+
+  id: UUID
+  employee_id: int
+  field: str
+  old_value: str | None = None
+  new_value: str | None = None
+  edit_id: UUID | None = None
+  db_login: str
+  recorded_at: UtcDatetime
+
+
+class Editor(TimeclockModel):
+  """`backend.editors` row: an account let into the shift corrections page. Only production's rows are read."""
+
+  email: str
+  employee_id: int | None = None
+  developer: bool = False
 
 
 class RuleRow(TimeclockModel):

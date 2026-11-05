@@ -300,3 +300,9 @@ def test_fingerprint_scan_round_trips():
   assert scan.image is not None and scan.image.get_secret_value() == b"image"
   assert scan.scores == {fingerprint_id: 40}
   assert FingerprintScan.model_validate(scan.model_dump()) == scan
+
+
+def test_new_fields_default_for_older_readers():
+  punch = Punch(id=uuid4(), employee_id=1, kind=PunchKind.CLOCK_IN, at=T, instance_id="1")
+  correction = PunchCorrection(id=uuid4(), punch_id=punch.id, action=CorrectionAction.VOID, recorded_at=T)
+  assert (punch.edit_id, correction.db_login, correction.edit_id) == (None, None, None)
