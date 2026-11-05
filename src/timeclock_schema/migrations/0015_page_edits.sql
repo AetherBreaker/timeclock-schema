@@ -44,15 +44,21 @@ END $$;
 REVOKE EXECUTE ON FUNCTION backend.editor_employee_id(name) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION backend.editor_employee_id(name) TO timeclock_editor_access;
 
-CREATE FUNCTION refuse_own_punch() RETURNS trigger LANGUAGE plpgsql AS $$
+-- search_path pinned on these and 0016's triggers so a badge's temporary table can't stand in for punches or the log.
+-- A page punch must name its save: shift_summary counts it as hand-made by that (0017), and without one it would pass
+-- for a clock's. Superusers pass the WHEN too, and add punches with no save.
+CREATE FUNCTION refuse_own_punch() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
   IF NEW.employee_id = backend.editor_employee_id(current_user) THEN
     RAISE insufficient_privilege USING MESSAGE = 'you can''t change your own punches';
   END IF;
+  IF NEW.edit_id IS NULL AND NOT (SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = current_user) THEN
+    RAISE check_violation USING MESSAGE = 'a punch added on the page must name its save (edit_id)';
+  END IF;
   RETURN NEW;
 END $$;
 
-CREATE FUNCTION refuse_own_correction() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION refuse_own_correction() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
   IF (SELECT p.employee_id FROM punches p WHERE p.id = NEW.punch_id) = backend.editor_employee_id(current_user) THEN
     RAISE insufficient_privilege USING MESSAGE = 'you can''t change your own punches';
@@ -67,10 +73,12 @@ CREATE TRIGGER punch_corrections_refuse_own BEFORE INSERT ON punch_corrections F
   WHEN (pg_has_role(current_user, 'timeclock_editor_access', 'MEMBER')) EXECUTE FUNCTION refuse_own_correction();
 
 -- Insert-only, as for the clocks: column grants leave out db_login, received_at and automatic, which the database or
--- the backend set. Fingerprint templates stay out of reach.
+-- the backend set. Fingerprint templates and PIN hashes stay out of reach: setting a PIN reads no old hash.
 GRANT USAGE ON SCHEMA config, backend TO timeclock_editor_access;
-GRANT SELECT ON employees, groups, punches, punch_corrections, edits, config.settings, config.business_hours,
-  backend.environment TO timeclock_editor_access;
+GRANT SELECT ON groups, punches, punch_corrections, edits, config.settings, config.business_hours, backend.environment
+  TO timeclock_editor_access;
+GRANT SELECT (id, first_name, middle_name, last_name, pin_username, role, active, group_id, phone, email, fingerprint_exempt,
+  updated_at) ON employees TO timeclock_editor_access;
 GRANT SELECT (id, employee_id, finger, registered_at, instance_id, db_login) ON fingerprints TO timeclock_editor_access;
 GRANT INSERT (id, employee_id, kind, at, instance_id, edit_id) ON punches TO timeclock_editor_access;
 GRANT INSERT (id, punch_id, action, new_at, new_kind, note, edit_id) ON punch_corrections TO timeclock_editor_access;

@@ -17,8 +17,8 @@ CREATE TABLE employee_changes (
 CREATE INDEX employee_changes_employee ON employee_changes (employee_id, recorded_at);
 
 -- SECURITY INVOKER, so db_login stamps the badge (0015); badges therefore get INSERT on the log. The page names its save
--- in timeclock.edit_id.
-CREATE FUNCTION log_employee_changes() RETURNS trigger LANGUAGE plpgsql AS $$
+-- in timeclock.edit_id. search_path pinned as on 0015's triggers.
+CREATE FUNCTION log_employee_changes() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
   edit uuid := nullif(current_setting('timeclock.edit_id', true), '')::uuid;
   old_row jsonb := to_jsonb(OLD);
@@ -37,7 +37,7 @@ CREATE TRIGGER employees_log_changes AFTER UPDATE ON employees FOR EACH ROW EXEC
 
 -- An editor may change their own name, contact details and PIN, but not these (owner). The lookup runs on every update
 -- so a badge with no allowlist row is refused here too.
-CREATE FUNCTION refuse_own_settings() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION refuse_own_settings() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
   own bigint := backend.editor_employee_id(current_user);
 BEGIN

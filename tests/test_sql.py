@@ -1444,7 +1444,11 @@ def _as_badge(web_login: str, email: str) -> Generator[psycopg.Connection]:
     yield c
 
 
-_PAGE_PUNCH: LiteralString = "INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%s, 'clock_in', %s, 'web')"
+# A punch from the page, in a save of its own.
+_PAGE_PUNCH: LiteralString = (
+  "WITH e AS (INSERT INTO edits (note) VALUES ('') RETURNING id)"
+  " INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) SELECT %s, 'clock_in', %s, 'web', e.id FROM e"
+)
 _OWN = "you can't change your own punches"
 
 
@@ -1718,3 +1722,69 @@ def test_correction_note_still_wins_over_the_save(fresh_db: str, web_login: str,
     ).fetchone()
     assert row is not None
     assert admin.execute("SELECT correction_note, corrected_at FROM punch_log").fetchall() == [("typo", row[0])]
+
+
+# Final review fixes: the badge function can't be borrowed, temporary tables can't stand in for the real ones, page
+# punches name their save, and badges never read PIN hashes.
+
+
+def test_nobody_but_the_owner_may_run_the_badge_function(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  # It runs as its owner: on a table of the caller's own it would grant or drop any role.
+  email = make_editor(None)
+  with psycopg.connect(fresh_db) as c:
+    may = "SELECT has_function_privilege(%s, 'backend.sync_editor_badge()', 'EXECUTE')"
+    assert c.execute(may, ("timeclock_web",)).fetchone() == (False,)
+    assert c.execute(may, (email,)).fetchone() == (False,)
+  with _as_badge(web_login, email) as c, pytest.raises(errors.InsufficientPrivilege), c.transaction():
+    c.execute("CREATE TEMP TABLE bait (email text)")
+    c.execute("CREATE TRIGGER bait AFTER INSERT ON bait FOR EACH ROW EXECUTE FUNCTION backend.sync_editor_badge()")
+
+
+def test_badge_function_serves_only_the_allowlist(fresh_db: str, admin_dsn: str):
+  email = _new_email()
+  try:
+    with psycopg.connect(fresh_db, autocommit=True) as c:
+      c.execute("CREATE TABLE bait (email text)")
+      c.execute("CREATE TRIGGER bait AFTER INSERT ON bait FOR EACH ROW EXECUTE FUNCTION backend.sync_editor_badge()")
+      with pytest.raises(errors.RaiseException, match=r"only backend\.editors"):
+        c.execute("INSERT INTO bait VALUES (%s)", (email,))
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(email)))
+
+
+def test_temporary_tables_cannot_stand_in_for_the_real_ones(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    own_id = _add_employee(admin)
+    other_id = _add_employee(admin, "Bob", "34")
+    punch_id = _add_punch(admin, own_id)
+  with _as_badge(web_login, make_editor(own_id)) as c:
+    # A temporary punches table claiming the editor's punch is someone else's.
+    with pytest.raises(errors.InsufficientPrivilege, match=_OWN), c.transaction():
+      c.execute(
+        sql.SQL("CREATE TEMP TABLE punches AS SELECT id, {}::bigint AS employee_id FROM public.punches").format(sql.Literal(other_id))
+      )
+      c.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (punch_id,))
+    # A temporary change log catching the entry.
+    with c.transaction():
+      c.execute("CREATE TEMP TABLE employee_changes (LIKE public.employee_changes INCLUDING DEFAULTS)")
+      c.execute("UPDATE employees SET role = 'admin' WHERE id = %s", (other_id,))
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT employee_id, field FROM employee_changes").fetchall() == [(other_id, "role")]
+
+
+def test_badge_punches_must_name_their_save(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  # shift_summary counts a page punch as hand-made by its save; one without would pass for a clock's.
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c, pytest.raises(errors.CheckViolation, match="name its save"), c.transaction():
+    c.execute("INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%s, 'clock_in', %s, 'web')", (employee_id, T))
+
+
+def test_badge_cannot_read_pin_hashes(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c:
+    with pytest.raises(errors.InsufficientPrivilege), c.transaction():
+      c.execute("SELECT pin_hash FROM employees")
+    assert c.execute("SELECT id, first_name, pin_username FROM employees").fetchall() == [(employee_id, "Ann", "12")]

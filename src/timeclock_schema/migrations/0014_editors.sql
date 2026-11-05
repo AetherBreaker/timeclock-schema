@@ -33,10 +33,14 @@ CREATE TABLE backend.deployment (
 );
 
 -- Creates, moves and drops each row's badge. Roles are server-wide, so outside production this does nothing: deleting a
--- row from the test database's unused list must never drop a production badge.
+-- row from the test database's unused list must never drop a production badge. It runs as its owner, so on any other
+-- table it would grant or drop any role: nobody else may run it, and it refuses any table but this one.
 CREATE FUNCTION backend.sync_editor_badge() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
+  IF TG_RELID <> 'backend.editors'::regclass THEN
+    RAISE EXCEPTION 'backend.sync_editor_badge() serves only backend.editors';
+  END IF;
   IF NOT coalesce((SELECT d.production FROM backend.deployment d), true) THEN
     RETURN NULL;
   END IF;
@@ -54,6 +58,7 @@ BEGIN
   END IF;
   RETURN NULL;
 END $$;
+REVOKE EXECUTE ON FUNCTION backend.sync_editor_badge() FROM PUBLIC;
 CREATE TRIGGER editors_badge AFTER INSERT OR UPDATE OR DELETE ON backend.editors
   FOR EACH ROW EXECUTE FUNCTION backend.sync_editor_badge();
 
