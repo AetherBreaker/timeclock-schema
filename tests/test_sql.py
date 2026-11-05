@@ -1415,3 +1415,138 @@ def test_only_the_page_login_may_look_up_editors(fresh_db: str):
     assert c.execute(may, ("timeclock_web",)).fetchone() == (True,)
     assert c.execute(may, ("timeclock_editor_access",)).fetchone() == (False,)
     assert c.execute(may, ("timeclock_clock_access",)).fetchone() == (False,)
+
+
+@contextmanager
+def _as_badge(web_login: str, email: str) -> Iterator[psycopg.Connection]:
+  """The page's connection: timeclock_web acting as the account's badge. Not autocommit; write in `c.transaction()`."""
+  with psycopg.connect(web_login) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(email)))
+    c.commit()
+    yield c
+
+
+_PAGE_PUNCH: LiteralString = "INSERT INTO punches (employee_id, kind, at, instance_id) VALUES (%s, 'clock_in', %s, 'page')"
+_OWN = "you can't change your own punches"
+
+
+def test_badge_adds_a_save_a_punch_and_a_correction(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    editor_id = _add_employee(admin)
+    other_id = _add_employee(admin, "Bob", "34")
+    punch_id = _add_punch(admin, other_id)
+  email = make_editor(editor_id)
+  with _as_badge(web_login, email) as c, c.transaction():
+    row = c.execute("INSERT INTO edits (note) VALUES ('left at 5') RETURNING id, db_login").fetchone()
+    assert row is not None
+    edit_id, login = row
+    assert login == email
+    c.execute(
+      "INSERT INTO punches (employee_id, kind, at, instance_id, edit_id) VALUES (%s, 'clock_out', %s, 'page', %s)",
+      (other_id, T + timedelta(hours=8), edit_id),
+    )
+    c.execute(
+      "INSERT INTO punch_corrections (punch_id, action, new_at, note, edit_id) VALUES (%s, 'amend', %s, 'came in early', %s)",
+      (punch_id, T - timedelta(minutes=5), edit_id),
+    )
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute("SELECT db_login, edit_id FROM punches WHERE edit_id IS NOT NULL").fetchall() == [(email, edit_id)]
+    assert admin.execute("SELECT db_login, edit_id FROM punch_corrections").fetchall() == [(email, edit_id)]
+
+
+def test_badge_cannot_touch_its_own_punches(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    own_id = _add_employee(admin)
+    punch_id = _add_punch(admin, own_id)
+  with _as_badge(web_login, make_editor(own_id)) as c:
+    with pytest.raises(errors.InsufficientPrivilege, match=_OWN), c.transaction():
+      c.execute(_PAGE_PUNCH, (own_id, T))
+    with pytest.raises(errors.InsufficientPrivilege, match=_OWN), c.transaction():
+      c.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (punch_id,))
+
+
+def test_editor_without_an_employee_number_has_no_block(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    punch_id = _add_punch(admin, employee_id)
+  with _as_badge(web_login, make_editor(None)) as c, c.transaction():
+    c.execute(_PAGE_PUNCH, (employee_id, T))
+    c.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (punch_id,))
+
+
+def test_removed_editor_is_refused_at_once(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  email = make_editor(None)
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    # Keeps the badge, as a session that SET ROLE before the row went would still hold it.
+    admin.execute("ALTER TABLE backend.editors DISABLE TRIGGER editors_badge")
+    admin.execute("DELETE FROM backend.editors WHERE email = %s", (email,))
+  with _as_badge(web_login, email) as c, pytest.raises(errors.InsufficientPrivilege, match="not on the allowlist"), c.transaction():
+    c.execute(_PAGE_PUNCH, (employee_id, T))
+
+
+def test_test_database_blocks_by_the_page_supplied_number(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  email = make_editor(None)  # made while the database counts as production, so the badge exists
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    admin.execute("INSERT INTO backend.deployment (production) VALUES (false)")
+    admin.execute("DELETE FROM backend.editors WHERE email = %s", (email,))  # the test database's list is never read
+  with _as_badge(web_login, email) as c:
+    with pytest.raises(errors.InsufficientPrivilege, match=_OWN), c.transaction():
+      c.execute("SELECT set_config('timeclock.editor_employee_id', %s, true)", (str(employee_id),))
+      c.execute(_PAGE_PUNCH, (employee_id, T))
+    with c.transaction():
+      c.execute(_PAGE_PUNCH, (employee_id, T))
+
+
+def test_production_ignores_a_page_supplied_number(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c, c.transaction():
+    c.execute("SELECT set_config('timeclock.editor_employee_id', %s, true)", (str(employee_id),))
+    c.execute(_PAGE_PUNCH, (employee_id, T))
+
+
+def test_badge_cannot_rewrite_history(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+    punch_id = _add_punch(admin, employee_id)
+    admin.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (punch_id,))
+    admin.execute("INSERT INTO edits (note) VALUES ('x')")
+    _add_print(admin, employee_id)
+  forbidden: list[tuple[LiteralString, tuple[object, ...] | None]] = [
+    ("UPDATE punches SET at = now()", None),
+    ("DELETE FROM punches", None),
+    ("UPDATE punch_corrections SET note = 'x'", None),
+    ("DELETE FROM punch_corrections", None),
+    ("INSERT INTO punches (employee_id, kind, at, instance_id, db_login) VALUES (%s, 'clock_in', %s, 'page', 'x')", (employee_id, T)),
+    (
+      "INSERT INTO punches (employee_id, kind, at, instance_id, automatic) VALUES (%s, 'clock_in', %s, 'page', true)",
+      (employee_id, T),
+    ),
+    ("INSERT INTO punch_corrections (punch_id, action, db_login) VALUES (%s, 'void', 'x')", (punch_id,)),
+    ("INSERT INTO edits (note, db_login) VALUES ('x', 'x')", None),
+    ("UPDATE edits SET note = 'x'", None),
+    ("DELETE FROM edits", None),
+    ("SELECT template FROM fingerprints", None),
+    ("SELECT * FROM backend.editors", None),
+    ("SELECT * FROM backend.auto_clock_out_runs", None),
+  ]
+  with _as_badge(web_login, make_editor(None)) as c:
+    for statement, params in forbidden:
+      with pytest.raises(errors.InsufficientPrivilege), c.transaction():
+        c.execute(statement, params)
+    assert len(c.execute("SELECT id, finger FROM fingerprints").fetchall()) == 1
+
+
+def test_clocks_and_owner_still_stamp_their_own_logins(fresh_db: str, clock_login: str):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    punch_id = _add_punch(c, employee_id)
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute("INSERT INTO punch_corrections (punch_id, action) VALUES (%s, 'void')", (punch_id,))
+    assert admin.execute("SELECT p.db_login, c.db_login FROM punches p JOIN punch_corrections c ON c.punch_id = p.id").fetchone() == (
+      conninfo_to_dict(clock_login)["user"],
+      conninfo_to_dict(fresh_db)["user"],
+    )
