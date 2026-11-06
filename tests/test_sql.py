@@ -1799,6 +1799,26 @@ def test_new_employees_stamp_who_added_them(fresh_db: str, clock_login: str):
   assert stamped == {by_clock: conninfo_to_dict(clock_login)["user"], by_owner: conninfo_to_dict(fresh_db)["user"]}
 
 
+def test_employees_from_before_0019_have_no_db_login(admin_dsn: str):
+  # PostgreSQL evaluates a non-volatile ADD COLUMN default once and stamps it on every existing row: the migrating login.
+  name = f"tcs_{uuid4().hex}"
+  with psycopg.connect(admin_dsn, autocommit=True) as admin:
+    admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+  try:
+    with psycopg.connect(make_conninfo(admin_dsn, dbname=name), autocommit=True) as c:
+      for m in load_migrations():
+        if m.version == 19:  # noqa: PLR2004 - the migration under test
+          before = _add_employee(c)
+        with c.transaction():
+          c.execute(cast("LiteralString", m.sql))  # package data, not user input
+      after = _add_employee(c, "Bob", "34")
+      stamped = dict(c.execute("SELECT id, db_login FROM employees").fetchall())
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
+  assert stamped == {before: None, after: conninfo_to_dict(admin_dsn)["user"]}
+
+
 def test_badges_can_read_who_added_an_employee(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
   with psycopg.connect(fresh_db, autocommit=True) as admin:
     employee_id = _add_employee(admin)
