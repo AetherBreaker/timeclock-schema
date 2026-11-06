@@ -302,8 +302,8 @@ class Settings(TimeclockModel):
   """Registration: how many of the other 4 kept presses each press must agree with."""
   registration_resemblance_bar: Annotated[int, Field(ge=0)] = 40
   """Registration: the score against another person's press at which a new press resembles it."""
-  registration_extra_presses: Annotated[int, Field(ge=0)] = 5
-  """Registration: how many failing presses may be replaced before it gives up."""
+  registration_disagreement_retries: Annotated[int, Field(ge=0)] = 5
+  """Registration: how many presses disagreeing with the others may be asked again before it gives up."""
 
   @model_validator(mode="after")
   def _check_detail_points(self) -> Self:

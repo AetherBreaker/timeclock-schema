@@ -1213,7 +1213,7 @@ def test_settings_default_the_registration_bars(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     row = c.execute(
       "SELECT registration_min_detail_points, registration_max_detail_points, registration_centre_tolerance,"
-      " registration_agreement_bar, registration_agreement_needed, registration_resemblance_bar, registration_extra_presses"
+      " registration_agreement_bar, registration_agreement_needed, registration_resemblance_bar, registration_disagreement_retries"
       " FROM config.settings"
     ).fetchone()
     assert row == (20, 120, 100, 41, 1, 40, 5)
@@ -1225,7 +1225,7 @@ def test_settings_default_the_registration_bars(fresh_db: str):
       "UPDATE config.settings SET registration_agreement_needed = -1",
       "UPDATE config.settings SET registration_agreement_needed = 5",
       "UPDATE config.settings SET registration_resemblance_bar = -1",
-      "UPDATE config.settings SET registration_extra_presses = -1",
+      "UPDATE config.settings SET registration_disagreement_retries = -1",
     ):
       with pytest.raises(errors.CheckViolation):
         c.execute(update)
