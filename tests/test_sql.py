@@ -1788,3 +1788,19 @@ def test_badge_cannot_read_pin_hashes(fresh_db: str, web_login: str, make_editor
     with pytest.raises(errors.InsufficientPrivilege), c.transaction():
       c.execute("SELECT pin_hash FROM employees")
     assert c.execute("SELECT id, first_name, pin_username FROM employees").fetchall() == [(employee_id, "Ann", "12")]
+
+
+def test_new_employees_stamp_who_added_them(fresh_db: str, clock_login: str):
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    by_clock = _add_employee(c)
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    by_owner = _add_employee(admin, "Bob", "34")
+    stamped = dict(admin.execute("SELECT id, db_login FROM employees").fetchall())
+  assert stamped == {by_clock: conninfo_to_dict(clock_login)["user"], by_owner: conninfo_to_dict(fresh_db)["user"]}
+
+
+def test_badges_can_read_who_added_an_employee(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    employee_id = _add_employee(admin)
+  with _as_badge(web_login, make_editor(None)) as c:
+    assert c.execute("SELECT id, db_login FROM employees").fetchall() == [(employee_id, conninfo_to_dict(fresh_db)["user"])]
