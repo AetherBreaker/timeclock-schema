@@ -752,6 +752,19 @@ def test_clock_login_adds_employees_and_managers_but_never_admins(fresh_db: str,
   assert rows == [(10001, "employee", False, True), (10002, "manager", False, True), (10003, "admin", False, True)]
 
 
+def test_a_temporary_pg_roles_doesnt_let_a_clock_add_an_admin(fresh_db: str, clock_login: str):
+  # A session's temporary tables come before pg_catalog unless the search_path lists pg_temp. Production revokes
+  # TEMPORARY from the clocks; a fresh database still grants it to PUBLIC.
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    c.execute("CREATE TEMPORARY TABLE pg_roles (rolname name, rolsuper boolean)")
+    c.execute("INSERT INTO pg_temp.pg_roles VALUES (current_user, true)")
+    with pytest.raises(errors.CheckViolation):
+      c.execute(
+        "INSERT INTO employees (id, first_name, last_name, pin_username, pin_hash, role, group_id)"
+        " VALUES (10003, 'Ann', 'Lee', '10003', crypt('1', gen_salt('bf')), 'admin', 1)"
+      )
+
+
 @pytest.mark.parametrize(
   ("columns", "ok"),
   [
@@ -1327,6 +1340,19 @@ def test_a_clock_insert_clears_fingerprint_data_older_than_28_days(fresh_db: str
     kept = admin.execute("SELECT result, margin FROM fingerprint_scans WHERE id = %s", (old,)).fetchone()
   assert cleared == {old: (True,), recent: (False,), late: (True,), new: (False,)}
   assert kept == ("no_match", 15)
+
+
+def test_a_temporary_fingerprint_scans_doesnt_take_a_clocks_prune(fresh_db: str, clock_login: str):
+  # The prune runs as its owner but in the clock's session, where a temporary table of the same name would come first.
+  now, old = datetime.now(UTC), uuid4()
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute(_INSERT_SCAN_WITH_DATA, (old, now))
+    admin.execute("UPDATE fingerprint_scans SET at = %s WHERE id = %s", (now - timedelta(days=29), old))
+  with psycopg.connect(clock_login, autocommit=True) as c:
+    c.execute("CREATE TEMPORARY TABLE fingerprint_scans (at timestamptz, probe bytea, image bytea, image_width int, image_height int)")
+    c.execute(_INSERT_SCAN_WITH_DATA.replace("INTO fingerprint_scans", "INTO public.fingerprint_scans"), (uuid4(), now))
+  with psycopg.connect(fresh_db) as admin:
+    assert admin.execute(_CLEARED, (old,)).fetchone() == (True,)
 
 
 def test_an_insert_skips_the_prune_while_another_runs_it(fresh_db: str, clock_login: str):
