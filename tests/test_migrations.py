@@ -29,6 +29,11 @@ def test_editors_migration_is_fourteenth():
   assert (editors.version, editors.name) == (14, "editors")
 
 
+def test_scheduled_runs_migration_is_twenty_first():
+  m = load_migrations()[20]
+  assert (m.version, m.name) == (21, "scheduled_runs")
+
+
 def test_versions_are_contiguous():
   assert [m.version for m in load_migrations()] == list(range(1, len(load_migrations()) + 1))
 

@@ -321,3 +321,12 @@ class AutoClockOutRun(TimeclockModel):
   stamp: UtcDatetime
   ran_at: UtcDatetime | None = None
   closed: int | None = None
+
+
+class ScheduledRun(TimeclockModel):
+  """`backend.scheduled_runs` row: a catch-up job's last completed run; `period` is the run's own label, `scheduled_for` its due instant."""
+
+  name: str
+  period: str
+  scheduled_for: UtcDatetime
+  completed_at: UtcDatetime
