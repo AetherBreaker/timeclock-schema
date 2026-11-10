@@ -45,6 +45,7 @@ from timeclock_schema.models import (
   Punch,
   PunchCorrection,
   RuleRow,
+  ScheduledRun,
   Settings,
 )
 from timeclock_schema.shifts import apply_corrections, build_timeline, total_hours, week_bounds
@@ -955,6 +956,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     c.execute("""INSERT INTO rules (kind, params, employee_id, on_violation) VALUES ('k', '{"n": 1}', %s, 'refuse')""", (employee_id,))
     c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
     c.execute("INSERT INTO backend.environment (tz) VALUES ('UTC')")
+    c.execute("INSERT INTO backend.scheduled_runs (name, period, scheduled_for) VALUES ('payroll_report', '2026-11-02', %s)", (T,))
     tables: list[tuple[LiteralString, type[TimeclockModel]]] = [
       ("groups", Group),
       ("employees", Employee),
@@ -970,6 +972,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
       ("edits", Edit),
       ("employee_changes", EmployeeChange),
       ("backend.editors", Editor),
+      ("backend.scheduled_runs", ScheduledRun),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -988,6 +991,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     "edits": 1,
     "employee_changes": 1,
     "backend.editors": 1,
+    "backend.scheduled_runs": 1,
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
