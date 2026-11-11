@@ -55,8 +55,8 @@ def test_version_one_registers_the_weekly_hours_notice():
 
 
 def test_weekly_hours_counts_worked_plus_paid_breaks():
-  # Five 8-hour shifts, each with a paid 30-minute break: 37.5 h worked + 2.5 h paid = 40 h, exactly the default limit.
-  ctx = context(week_of_shifts(5, 8 * H, break_minutes=30))
+  # Five 8-hour shifts, each with a paid 15-minute break: 38.75 h worked + 1.25 h paid = 40 h, exactly the default limit.
+  ctx = context(week_of_shifts(5, 8 * H, break_minutes=15))
   assert ALERT_TYPES[WEEKLY_HOURS].measure(ctx) == 40 * H
   assert fired_hooks(ctx) == (Firing(HOOKS[0], measure=40 * H, limit=40 * H),)
 

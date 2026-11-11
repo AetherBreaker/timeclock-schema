@@ -213,9 +213,10 @@ def total_hours(
 
   - A punch whose effective time is after `now` doesn't count yet (the automatic clock-out may be written early, §8.4);
     an open shift, break or lunch runs until `now`.
-  - Lunch is unpaid. Breaks are paid up to `settings.paid_break_minutes` per local calendar day in `tz`, each break
-    charged in full to the day it started, earliest first; the rest is unpaid.
-  - Each break is split where its day's allowance runs out, and the paid head and unpaid tail are then clipped to the
+  - Lunch is unpaid. Each break is paid up to `settings.break_limit_minutes` (0: no limit), and the paid parts up to
+    `settings.paid_break_minutes` per local calendar day in `tz`, charged to the day the break started, earliest first;
+    the rest is unpaid.
+  - Each break is split where its limit or its day's allowance runs out, and the paid head and unpaid tail are then clipped to the
     range: a range edge cuts a break's parts, never changes how much of it is paid. So pass every punch of any day the
     range touches, or a day's earlier breaks go uncharged.
 
@@ -226,6 +227,7 @@ def total_hours(
     raise ValueError("naive datetime; pass an aware one")
   start, end, now = start.astimezone(UTC), end.astimezone(UTC), now.astimezone(UTC)
   allowance = timedelta(minutes=settings.paid_break_minutes)
+  limit = timedelta(minutes=settings.break_limit_minutes) if settings.break_limit_minutes else timedelta.max
   allowance_left: dict[date, timedelta] = {}
   worked = paid_break = unpaid = timedelta()
   for shift in build_timeline(punches, corrections, as_of=now).shifts:  # chronological, so breaks are charged in order
@@ -245,7 +247,7 @@ def total_hours(
     for brk in shift.breaks:
       brk_end = now if brk.end is None else brk.end
       day = brk.start.astimezone(tz).date()
-      paid_length = min(allowance_left.get(day, allowance), brk_end - brk.start)
+      paid_length = min(allowance_left.get(day, allowance), brk_end - brk.start, limit)
       allowance_left[day] = allowance_left.get(day, allowance) - paid_length
       paid_part, unpaid_part = counted(brk.start, brk.start + paid_length), counted(brk.start + paid_length, brk_end)
       worked -= paid_part + unpaid_part

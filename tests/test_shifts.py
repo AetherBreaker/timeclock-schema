@@ -28,7 +28,8 @@ T = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)  # Tuesday 08:00 EDT
 H = timedelta(hours=1)
 M = timedelta(minutes=1)
 NY = ZoneInfo("America/New_York")
-S = Settings()  # a 30-minute daily paid break allowance
+S = Settings(break_limit_minutes=0)  # a 30-minute daily paid break allowance, no per-break limit
+CAPPED = Settings(break_limit_minutes=15)  # the same, each break paid up to 15 minutes
 
 
 def punch(kind: PunchKind, at: datetime, *, automatic: bool = False, punch_id: UUID | None = None, employee_id: int = 1) -> Punch:
@@ -202,6 +203,43 @@ def test_break_time_over_the_daily_allowance_is_unpaid():
   assert hours(one_long, now=T + 9 * H, settings=no_allowance) == HoursTotals(
     worked=8 * H - 45 * M, paid_break=timedelta(), unpaid=45 * M
   )
+
+
+def test_a_break_past_the_per_break_limit_pays_exactly_the_limit():
+  # Seconds count: 15:30 pays 15:00 and leaves 0:30 unpaid.
+  shift = [punch(CLOCK_IN, T), punch(BREAK_START, T + H), punch(BREAK_END, T + H + 15.5 * M), punch(CLOCK_OUT, T + 8 * H)]
+  assert hours(shift, now=T + 9 * H, settings=CAPPED) == HoursTotals(
+    worked=8 * H - 15.5 * M, paid_break=15 * M, unpaid=timedelta(seconds=30)
+  )
+
+
+def test_only_a_breaks_paid_part_counts_against_the_daily_allowance():
+  # 20 and 12 minutes pay 15 + 12. Charging the first break's whole 20 would leave the second 10; with no limit, 20 + 10.
+  two = [
+    punch(CLOCK_IN, T),
+    punch(BREAK_START, T + H),
+    punch(BREAK_END, T + H + 20 * M),
+    punch(BREAK_START, T + 3 * H),
+    punch(BREAK_END, T + 3 * H + 12 * M),
+    punch(CLOCK_OUT, T + 8 * H),
+  ]
+  assert hours(two, now=T + 9 * H, settings=CAPPED) == HoursTotals(worked=8 * H - 32 * M, paid_break=27 * M, unpaid=5 * M)
+  assert hours(two, now=T + 9 * H) == HoursTotals(worked=8 * H - 32 * M, paid_break=30 * M, unpaid=2 * M)
+
+
+def test_the_daily_allowance_still_stops_a_third_capped_break():
+  three = [punch(CLOCK_IN, T)]
+  for n in range(3):
+    three += [punch(BREAK_START, T + (n + 1) * H), punch(BREAK_END, T + (n + 1) * H + 20 * M)]
+  three.append(punch(CLOCK_OUT, T + 8 * H))
+  assert hours(three, now=T + 9 * H, settings=CAPPED) == HoursTotals(worked=7 * H, paid_break=30 * M, unpaid=30 * M)
+
+
+def test_a_range_edge_clips_a_capped_break_without_reallocating_it():
+  # A 20-minute break pays 0-15 and leaves 15-20 unpaid; a range from minute 10 holds 5 of each.
+  shift = [punch(CLOCK_IN, T - H), punch(BREAK_START, T), punch(BREAK_END, T + 20 * M), punch(CLOCK_OUT, T + H)]
+  got = total_hours(shift, settings=CAPPED, tz=NY, start=T + 10 * M, end=T + 2 * H, now=T + 2 * H)
+  assert got == HoursTotals(worked=40 * M, paid_break=5 * M, unpaid=5 * M)
 
 
 def test_a_break_counts_toward_the_day_it_started():

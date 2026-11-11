@@ -432,8 +432,9 @@ def _day_bounds(at: datetime, tz: ZoneInfo) -> tuple[datetime, datetime]:
 
 def test_hours_views_match_total_hours(fresh_db: str):
   # The views repeat total_hours's rules; each week's and day's totals must be the same. Covered: the daily allowance spent
-  # across two breaks, lunch, a repeated clock-in and a stray break end, a void and an amend, a shift and a break across
-  # Monday 00:00, a shift across the end of DST, and a shift still open, on a break, with an automatic clock-out stamped later.
+  # across two breaks, and across two shifts' breaks capped at the default 15-minute limit, lunch, a repeated clock-in and a
+  # stray break end, a void and an amend, a shift and a break across Monday 00:00, a shift across the end of DST, and a
+  # shift still open, on a break, with an automatic clock-out stamped later.
   with psycopg.connect(fresh_db, autocommit=True) as c:
     c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
     ann, bob = _add_employee(c), _add_employee(c, "Bob", "34")
@@ -449,6 +450,14 @@ def test_hours_views_match_total_hours(fresh_db: str):
       ("clock_in", _ny(21, 9)),
       ("clock_in", _ny(21, 9, 5)),
       ("break_end", _ny(21, 9, 30)),
+      ("clock_in", _ny(22, 9)),  # 20 minutes pays 15 and leaves 15 of the day's 30 for the afternoon's 12
+      ("break_start", _ny(22, 10)),
+      ("break_end", _ny(22, 10, 20)),
+      ("clock_out", _ny(22, 12)),
+      ("clock_in", _ny(22, 13)),
+      ("break_start", _ny(22, 14)),
+      ("break_end", _ny(22, 14, 12)),
+      ("clock_out", _ny(22, 17)),
       ("clock_in", _ny(25, 22)),  # Sunday into Monday
       ("break_start", _ny(25, 23, 50)),
       ("break_end", _ny(26, 0, 20)),
@@ -491,7 +500,7 @@ def test_hours_views_match_total_hours(fresh_db: str):
     log = c.execute("SELECT employee_id, id, kind::text, at FROM punch_log").fetchall()
     with c.cursor(row_factory=dict_row) as cur:
       settings = Settings.model_validate(cur.execute("SELECT * FROM config.settings").fetchone())
-      all_paid = settings.model_copy(update={"paid_break_minutes": 24 * 60})
+      all_paid = settings.model_copy(update={"paid_break_minutes": 24 * 60, "break_limit_minutes": 0})
       expected = {"weekly_hours": {}, "daily_hours": {}, "shift_summary": {}}
       expected_log = []
       left_out = []
@@ -601,6 +610,39 @@ def test_shift_summary_breaks_down_each_shift(fresh_db: str, clock_login: str):
       *("8:00", "6:56", "0:30", "0:03", "0:30", 2, 1, 1, "0:02", "10:00-10:17 (+2), 15:00-15:15", "12:00-12:30"),
     ),
   ]
+
+
+def test_the_break_limit_caps_each_break_in_every_hours_view(fresh_db: str):
+  # Monday: breaks of 20 and 12 minutes against the daily 30. Per limit, each view's paid and unpaid break time, and
+  # shift_summary's over-limit columns, which follow the limit in whole minutes and flag nothing at 0.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    c.execute("INSERT INTO backend.environment (tz) VALUES ('America/New_York')")
+    ann = _add_employee(c)
+    for kind, at in [
+      ("clock_in", _ny(19, 9)),
+      ("break_start", _ny(19, 10)),
+      ("break_end", _ny(19, 10, 20)),
+      ("break_start", _ny(19, 13)),
+      ("break_end", _ny(19, 13, 12)),
+      ("clock_out", _ny(19, 17)),
+    ]:
+      _add_punch_at(c, ann, kind, at)
+    assert c.execute("SELECT break_limit_minutes FROM config.settings").fetchone() == (15,)
+    got = {}
+    for limit in (15, 10, 0):
+      c.execute("UPDATE config.settings SET break_limit_minutes = %s", (limit,))
+      got[limit] = [
+        *(
+          c.execute(sql.SQL("SELECT breaks, unpaid_breaks FROM {}").format(sql.Identifier(view))).fetchone()
+          for view in ("weekly_hours", "daily_hours")
+        ),
+        c.execute("SELECT breaks, unpaid_breaks, breaks_over_limit, break_overage, break_times FROM shift_summary").fetchone(),
+      ]
+  assert got == {
+    15: [("0:27", "0:05"), ("0:27", "0:05"), ("0:27", "0:05", 1, "0:05", "10:00-10:20 (+5), 13:00-13:12")],
+    10: [("0:20", "0:12"), ("0:20", "0:12"), ("0:20", "0:12", 2, "0:12", "10:00-10:20 (+10), 13:00-13:12 (+2)")],
+    0: [("0:30", "0:02"), ("0:30", "0:02"), ("0:30", "0:02", 0, "0:00", "10:00-10:20, 13:00-13:12")],
+  }
 
 
 def test_new_employee_names_are_capitalized_unless_typed_mixed(fresh_db: str):
@@ -807,7 +849,12 @@ def test_login_bypass_checks(fresh_db: str, reason: str):
 
 
 @pytest.mark.parametrize(
-  "statement", ["UPDATE config.settings SET paid_break_minutes = -1", "UPDATE config.settings SET weekly_hours_alert = 0"]
+  "statement",
+  [
+    "UPDATE config.settings SET paid_break_minutes = -1",
+    "UPDATE config.settings SET weekly_hours_alert = 0",
+    "UPDATE config.settings SET break_limit_minutes = -1",
+  ],
 )
 def test_hours_settings_checks(fresh_db: str, statement: LiteralString):
   with psycopg.connect(fresh_db, autocommit=True) as c, pytest.raises(errors.CheckViolation):
