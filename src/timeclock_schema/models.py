@@ -284,6 +284,9 @@ class Settings(TimeclockModel):
   """Business-wide switches for starting a lunch or a break (ending one is always offered); a per-group override may come later."""
   paid_break_minutes: Annotated[int, Field(ge=0)] = 30
   """Paid break time allowed per local day; break time beyond it is unpaid (§4.5)."""
+  break_limit_minutes: Annotated[int, Field(ge=0)] = 15
+  """Paid time allowed per break, exactly: a break's time beyond it is unpaid, and only its paid part counts against
+  `paid_break_minutes`. 0: no per-break limit."""
   weekly_hours_alert: Annotated[Decimal, Field(gt=0, max_digits=6, decimal_places=2)] = Decimal(40)
   """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
   save_scan_images: bool = True
