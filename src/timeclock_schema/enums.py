@@ -91,6 +91,8 @@ class ScanResult(StrEnum):
   NO_MATCH = "no_match"
   TOO_CLOSE = "too_close"
   """The best score beat another employee's by less than the match margin."""
+  TOO_WEAK = "too_weak"
+  """The best score was under the minimum match score."""
   RETRY = "retry"
   """The reader asked for another scan (`retry_message` says why)."""
 

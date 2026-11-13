@@ -294,8 +294,10 @@ class Settings(TimeclockModel):
   """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
   save_scan_images: bool = True
   """Whether the clocks store each scan's image in `fingerprint_scans`."""
-  fingerprint_match_margin: Annotated[int, Field(ge=0)] = 15
+  fingerprint_match_margin: Annotated[int, Field(ge=0)] = 20
   """How far the best score must beat the best of a different employee's to count as a match."""
+  fingerprint_match_min_score: Annotated[int, Field(ge=0)] = 45
+  """The lowest best score that counts as a match; 40 or less leaves the reader's own threshold (40) in charge."""
   registration_min_detail_points: Annotated[int, Field(ge=0)] = 20
   """Registration: the fewest detail points a press may have (a light or partial press has fewer)."""
   registration_max_detail_points: Annotated[int, Field(ge=0)] = 120

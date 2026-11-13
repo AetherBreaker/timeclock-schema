@@ -27,7 +27,7 @@ from psycopg.rows import dict_row
 from pydantic import StringConstraints, TypeAdapter, ValidationError
 
 # First party imports
-from timeclock_schema.enums import Finger
+from timeclock_schema.enums import Finger, ScanResult
 from timeclock_schema.migrations import load_migrations
 from timeclock_schema.models import (
   EMAIL_PATTERN,
@@ -872,6 +872,11 @@ def _add_print(c: psycopg.Connection, employee_id: int, finger: str = "left_inde
   return fingerprint_id
 
 
+def test_scan_result_values_match_the_sql(fresh_db: str):
+  with psycopg.connect(fresh_db) as c:
+    assert c.execute("SELECT enum_range(NULL::scan_result)::text").fetchone() == ("{" + ",".join(ScanResult) + "}",)
+
+
 def test_finger_values_match_the_sql(fresh_db: str):
   with psycopg.connect(fresh_db) as c:
     assert c.execute("SELECT enum_range(NULL::finger)::text").fetchone() == ("{" + ",".join(Finger) + "}",)
@@ -1270,9 +1275,11 @@ def test_unrelated_settings_edit_reprojects_identically(fresh_db: str):
 
 def test_settings_default_the_scan_switches(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
-    assert c.execute("SELECT save_scan_images, fingerprint_match_margin FROM config.settings").fetchone() == (True, 15)
-    with pytest.raises(errors.CheckViolation):
-      c.execute("UPDATE config.settings SET fingerprint_match_margin = -1")
+    row = c.execute("SELECT save_scan_images, fingerprint_match_margin, fingerprint_match_min_score FROM config.settings")
+    assert row.fetchone() == (True, 20, 45)
+    for column in ("fingerprint_match_margin", "fingerprint_match_min_score"):
+      with pytest.raises(errors.CheckViolation):
+        c.execute(f"UPDATE config.settings SET {column} = -1")  # a fixed column name
 
 
 def test_settings_default_the_registration_bars(fresh_db: str):
