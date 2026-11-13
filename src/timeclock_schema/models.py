@@ -287,6 +287,9 @@ class Settings(TimeclockModel):
   break_limit_minutes: Annotated[int, Field(ge=0)] = 15
   """Paid time allowed per break, exactly: a break's time beyond it is unpaid, and only its paid part counts against
   `paid_break_minutes`. 0: no per-break limit."""
+  max_breaks_per_day: Annotated[int, Field(ge=0)] = 2
+  """Breaks an employee is expected to take in a local day; the shift corrections page flags a shift holding one past
+  it (never blocking anything). 0: no limit."""
   weekly_hours_alert: Annotated[Decimal, Field(gt=0, max_digits=6, decimal_places=2)] = Decimal(40)
   """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
   save_scan_images: bool = True
