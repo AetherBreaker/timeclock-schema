@@ -176,6 +176,7 @@ def test_seed_rows(fresh_db: str):
       "SELECT auto_clock_out_enabled, auto_clock_out_run_time, auto_clock_out_stamp_time, auto_clock_out_frequency,"
       " lunches_enabled, breaks_enabled, paid_break_minutes, weekly_hours_alert FROM config.settings"
     ).fetchall() == [(True, time(23), time(23), "daily", True, True, 30, Decimal(40))]
+    assert c.execute("SELECT max_breaks_per_day FROM config.settings").fetchone() == (Settings().max_breaks_per_day,)
     assert c.execute("SELECT count(*) FROM config.business_hours").fetchone() == (0,)
     with pytest.raises(errors.UndefinedColumn):  # the hours function replaces them (owner, 2026-10-27)
       c.execute("SELECT subtract_lunch FROM config.settings")
@@ -854,6 +855,7 @@ def test_login_bypass_checks(fresh_db: str, reason: str):
     "UPDATE config.settings SET paid_break_minutes = -1",
     "UPDATE config.settings SET weekly_hours_alert = 0",
     "UPDATE config.settings SET break_limit_minutes = -1",
+    "UPDATE config.settings SET max_breaks_per_day = -1",
   ],
 )
 def test_hours_settings_checks(fresh_db: str, statement: LiteralString):
