@@ -232,9 +232,11 @@ def test_employee_names():
 
 def test_settings_scan_defaults():
   s = Settings()
-  assert (s.save_scan_images, s.fingerprint_match_margin) == (True, 15)
+  assert (s.save_scan_images, s.fingerprint_match_margin, s.fingerprint_match_min_score) == (True, 20, 45)
   with pytest.raises(ValidationError):
     Settings(fingerprint_match_margin=-1)
+  with pytest.raises(ValidationError):
+    Settings(fingerprint_match_min_score=-1)
 
 
 def test_settings_registration_defaults():
