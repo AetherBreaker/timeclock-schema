@@ -1282,14 +1282,26 @@ def test_settings_default_the_scan_switches(fresh_db: str):
         c.execute(f"UPDATE config.settings SET {column} = -1")  # a fixed column name
 
 
+def test_settings_have_no_rescan_cap(fresh_db: str):
+  # 0025: a registration never gives up (owner, 2026-11-17), so the cap's column is gone.
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    columns = {
+      r[0]
+      for r in c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'config' AND table_name = 'settings'"
+      )
+    }
+  assert "registration_resemblance_bar" in columns
+  assert "registration_disagreement_retries" not in columns
+
+
 def test_settings_default_the_registration_bars(fresh_db: str):
   with psycopg.connect(fresh_db, autocommit=True) as c:
     row = c.execute(
       "SELECT registration_min_detail_points, registration_max_detail_points, registration_centre_tolerance,"
-      " registration_agreement_bar, registration_agreement_needed, registration_resemblance_bar, registration_disagreement_retries"
-      " FROM config.settings"
+      " registration_agreement_bar, registration_agreement_needed, registration_resemblance_bar FROM config.settings"
     ).fetchone()
-    assert row == (20, 120, 100, 41, 1, 40, 5)
+    assert row == (20, 120, 100, 41, 1, 40)
     for update in (
       "UPDATE config.settings SET registration_min_detail_points = -1",
       "UPDATE config.settings SET registration_max_detail_points = 19",
@@ -1298,7 +1310,6 @@ def test_settings_default_the_registration_bars(fresh_db: str):
       "UPDATE config.settings SET registration_agreement_needed = -1",
       "UPDATE config.settings SET registration_agreement_needed = 5",
       "UPDATE config.settings SET registration_resemblance_bar = -1",
-      "UPDATE config.settings SET registration_disagreement_retries = -1",
     ):
       with pytest.raises(errors.CheckViolation):
         c.execute(update)
