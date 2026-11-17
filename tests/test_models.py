@@ -248,8 +248,12 @@ def test_settings_registration_defaults():
     s.registration_agreement_bar,
     s.registration_agreement_needed,
     s.registration_resemblance_bar,
-    s.registration_disagreement_retries,
-  ) == (20, 120, 100, 41, 1, 40, 5)
+  ) == (20, 120, 100, 41, 1, 40)
+
+
+def test_settings_have_no_rescan_cap():
+  # A registration never gives up (owner, 2026-11-17): the cap on disagreeing presses is gone.
+  assert "registration_disagreement_retries" not in Settings.model_fields
 
 
 @pytest.mark.parametrize(
@@ -262,7 +266,6 @@ def test_settings_registration_defaults():
     {"registration_agreement_needed": -1},
     {"registration_agreement_needed": 5},
     {"registration_resemblance_bar": -1},
-    {"registration_disagreement_retries": -1},
   ],
 )
 def test_settings_registration_bounds(values: dict[str, int]):
