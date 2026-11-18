@@ -45,6 +45,7 @@ from timeclock_schema.models import (
   Punch,
   PunchCorrection,
   ReportRecipient,
+  ReportSend,
   RuleRow,
   ScheduledRun,
   Settings,
@@ -1012,6 +1013,10 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     c.execute("INSERT INTO config.business_hours (weekday, opens, closes) VALUES (7, '09:00', '23:59:59')")
     c.execute("INSERT INTO backend.environment (tz) VALUES ('UTC')")
     c.execute("INSERT INTO backend.scheduled_runs (name, period, scheduled_for) VALUES ('payroll_report', '2026-11-02', %s)", (T,))
+    c.execute(
+      "INSERT INTO backend.report_sends (report, week_start, recipients) VALUES ('payroll_report', '2026-11-02', %s)",
+      (["jacob.ogden@sweetfiretobacco.com"],),
+    )
     tables: list[tuple[LiteralString, type[TimeclockModel]]] = [
       ("groups", Group),
       ("employees", Employee),
@@ -1029,6 +1034,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
       ("backend.editors", Editor),
       ("backend.scheduled_runs", ScheduledRun),
       ("backend.report_recipients", ReportRecipient),
+      ("backend.report_sends", ReportSend),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -1049,6 +1055,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     "backend.editors": 1,
     "backend.scheduled_runs": 1,
     "backend.report_recipients": 1,  # the migration's seed
+    "backend.report_sends": 1,
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
@@ -1083,12 +1090,97 @@ def test_report_recipients_seed_and_checks(fresh_db: str):
     c.execute("INSERT INTO backend.report_recipients VALUES ('other_report', 'jacob.ogden@sweetfiretobacco.com')")
 
 
+_SEND = "INSERT INTO backend.report_sends (report, week_start, recipients) VALUES ('payroll_report', %s, %s)"
+_SEEDED = "jacob.ogden@sweetfiretobacco.com"  # 0026's payroll_report recipient
+
+
+def test_report_send_stamps_the_badge_and_starts_pending(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  email = make_editor(developer=True)
+  with psycopg.connect(web_login, autocommit=True) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(email)))
+    row = c.execute(_SEND + " RETURNING requested_by, status, finished_at, error", (date(2026, 11, 9), [_SEEDED])).fetchone()
+    assert row == (email, "pending", None, None)
+    with pytest.raises(errors.InsufficientPrivilege):  # the outcome columns aren't the badge's to set
+      c.execute(
+        "INSERT INTO backend.report_sends (report, week_start, recipients, status) VALUES ('payroll_report', %s, %s, 'sent')",
+        (date(2026, 11, 9), [_SEEDED]),
+      )
+
+
+def test_report_send_refuses_unenrolled_duplicate_empty_and_non_monday(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:  # the owner: the trigger holds for every login
+    for recipients in ([], [_SEEDED, _SEEDED]):
+      with pytest.raises(errors.RaiseException):
+        c.execute(_SEND, (date(2026, 11, 9), recipients))
+    with pytest.raises(errors.RaiseException, match=r"nobody@example\.com is not enrolled for payroll_report"):
+      c.execute(_SEND, (date(2026, 11, 9), ["nobody@example.com"]))
+    with pytest.raises(errors.CheckViolation):
+      c.execute(_SEND, (date(2026, 11, 10), [_SEEDED]))  # a Tuesday
+    row = c.execute(
+      "INSERT INTO backend.report_sends (report, week_start, recipients, requested_by, status) VALUES "
+      "('payroll_report', %s, %s, 'someone-else', 'sent') RETURNING requested_by, status",
+      (date(2026, 11, 9), [_SEEDED]),
+    ).fetchone()
+    assert row == (conninfo_to_dict(fresh_db)["user"], "pending")  # forced, whatever the insert said
+
+
+def test_only_developer_badges_may_request_or_read_recipients(fresh_db: str, web_login: str, make_editor: Callable[..., str]):
+  editor, developer = make_editor(), make_editor(developer=True)
+  with psycopg.connect(web_login, autocommit=True) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(editor)))
+    for statement in ("SELECT * FROM backend.report_recipients", "SELECT * FROM backend.report_sends"):
+      with pytest.raises(errors.InsufficientPrivilege):
+        c.execute(cast("LiteralString", statement))
+    with pytest.raises(errors.InsufficientPrivilege):
+      c.execute(_SEND, (date(2026, 11, 9), [_SEEDED]))
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(developer)))
+    assert c.execute("SELECT email FROM backend.report_recipients").fetchall() == [(_SEEDED,)]
+    c.execute(_SEND, (date(2026, 11, 9), [_SEEDED]))
+    c.execute("RESET ROLE")
+  with psycopg.connect(fresh_db, autocommit=True) as admin:
+    admin.execute("UPDATE backend.editors SET developer = false WHERE email = %s", (developer,))
+  with psycopg.connect(web_login, autocommit=True) as c:
+    c.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(developer)))
+    with pytest.raises(errors.InsufficientPrivilege):
+      c.execute(_SEND, (date(2026, 11, 9), [_SEEDED]))
+
+
+def test_a_request_pings_report_sends(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as listener, psycopg.connect(fresh_db, autocommit=True) as c:
+    listener.execute("LISTEN report_sends")
+    row = c.execute(_SEND + " RETURNING id", (date(2026, 11, 9), [_SEEDED])).fetchone()
+    assert row is not None
+    [n] = list(listener.notifies(timeout=5, stop_after=1))
+  assert n.payload == str(row[0])
+
+
+def test_0027_grants_existing_developers(admin_dsn: str):
+  name, email = f"tcs_{uuid4().hex}", _new_email()
+  with psycopg.connect(admin_dsn, autocommit=True) as admin:
+    admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+  try:
+    with psycopg.connect(make_conninfo(admin_dsn, dbname=name), autocommit=True) as c:
+      for m in load_migrations():
+        if m.version == 27:  # noqa: PLR2004 - the migration under test
+          c.execute("INSERT INTO backend.editors (email, developer) VALUES (%s, true)", (email,))
+        with c.transaction():
+          c.execute(cast("LiteralString", m.sql))  # package data, not user input
+      granted = c.execute("SELECT pg_has_role(%s, 'timeclock_report_senders', 'USAGE')", (email,)).fetchone()
+  finally:
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+      admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
+      admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(email)))  # badges are server-wide
+  assert granted == (True,)
+
+
 def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login: str):
   with psycopg.connect(clock_login, autocommit=True) as c:
     statements: list[LiteralString] = [
       "SELECT * FROM backend.auto_clock_out_runs",
       "SELECT * FROM backend.environment",
       "SELECT backend.project_auto_clock_out_runs()",
+      "SELECT * FROM backend.report_recipients",
+      "SELECT * FROM backend.report_sends",
     ]
     for statement in statements:
       with pytest.raises(errors.InsufficientPrivilege):

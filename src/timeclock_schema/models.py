@@ -2,7 +2,7 @@
 
 # Standard library imports
 import base64
-from datetime import time
+from datetime import date, time
 from decimal import Decimal
 from typing import Annotated, Any, Final, Self
 from uuid import UUID
@@ -343,3 +343,17 @@ class ReportRecipient(TimeclockModel):
 
   report: str
   email: str
+
+
+class ReportSend(TimeclockModel):
+  """`backend.report_sends` row: a developer's request to send a report's week now, and its outcome."""
+
+  id: int
+  report: str
+  week_start: date
+  recipients: list[str]
+  requested_by: str
+  requested_at: UtcDatetime
+  status: str
+  finished_at: UtcDatetime | None = None
+  error: str | None = None
