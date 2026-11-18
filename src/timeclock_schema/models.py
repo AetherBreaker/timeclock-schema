@@ -336,3 +336,10 @@ class ScheduledRun(TimeclockModel):
   period: str
   scheduled_for: UtcDatetime
   completed_at: UtcDatetime
+
+
+class ReportRecipient(TimeclockModel):
+  """`backend.report_recipients` row: one address a scheduled report's entry sends to. Only production's rows are read."""
+
+  report: str
+  email: str
