@@ -125,6 +125,7 @@ def test_settings_defaults_match_the_seed_row():
   assert s.auto_clock_out_frequency is AutoClockOutFrequency.DAILY
   assert (s.lunches_enabled, s.breaks_enabled) == (True, True)
   assert (s.paid_break_minutes, s.weekly_hours_alert, s.max_breaks_per_day) == (30, Decimal(40), 2)
+  assert (s.break_grace_minutes, s.lunch_expected_minutes, s.lunch_grace_minutes) == (15, 30, 15)
   assert "subtract_lunch" not in Settings.model_fields
 
 
@@ -143,7 +144,15 @@ def test_settings_new_columns_default_when_absent():
   with pytest.raises(ValidationError):
     Settings.model_validate({"auto_clock_out_frequency": "weekly"})
   assert Settings.model_validate(old_row).paid_break_minutes == Settings().paid_break_minutes
-  for bad in ({"paid_break_minutes": -1}, {"weekly_hours_alert": 0}, {"weekly_hours_alert": "40.125"}, {"max_breaks_per_day": -1}):
+  for bad in (
+    {"paid_break_minutes": -1},
+    {"weekly_hours_alert": 0},
+    {"weekly_hours_alert": "40.125"},
+    {"max_breaks_per_day": -1},
+    {"break_grace_minutes": -1},
+    {"lunch_expected_minutes": -1},
+    {"lunch_grace_minutes": -1},
+  ):
     with pytest.raises(ValidationError):
       Settings.model_validate(bad)
   assert Settings.model_validate_json(Settings(weekly_hours_alert=Decimal("37.5")).model_dump_json()).weekly_hours_alert == Decimal(

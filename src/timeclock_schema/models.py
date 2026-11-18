@@ -290,6 +290,13 @@ class Settings(TimeclockModel):
   max_breaks_per_day: Annotated[int, Field(ge=0)] = 2
   """Breaks an employee is expected to take in a local day; the shift corrections page flags a shift holding one past
   it (never blocking anything). 0: no limit."""
+  break_grace_minutes: Annotated[int, Field(ge=0)] = 15
+  """How far past `break_limit_minutes` a break may run before the shift corrections page flags it as long; never
+  blocks anything."""
+  lunch_expected_minutes: Annotated[int, Field(ge=0)] = 30
+  """A lunch's expected longest length; payroll never reads it, only the shift corrections page's long-lunch flag."""
+  lunch_grace_minutes: Annotated[int, Field(ge=0)] = 15
+  """How far past `lunch_expected_minutes` a lunch may run before the shift corrections page flags it as long."""
   weekly_hours_alert: Annotated[Decimal, Field(gt=0, max_digits=6, decimal_places=2)] = Decimal(40)
   """The weekly hours alert's limit in hours, worked plus paid breaks (§6.11); it never restricts anyone."""
   save_scan_images: bool = True
