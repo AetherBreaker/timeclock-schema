@@ -44,6 +44,7 @@ from timeclock_schema.models import (
   Group,
   Punch,
   PunchCorrection,
+  ReportRecipient,
   RuleRow,
   ScheduledRun,
   Settings,
@@ -1027,6 +1028,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
       ("employee_changes", EmployeeChange),
       ("backend.editors", Editor),
       ("backend.scheduled_runs", ScheduledRun),
+      ("backend.report_recipients", ReportRecipient),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -1046,6 +1048,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     "employee_changes": 1,
     "backend.editors": 1,
     "backend.scheduled_runs": 1,
+    "backend.report_recipients": 1,  # the migration's seed
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
@@ -1065,6 +1068,19 @@ def test_run_row_checks(fresh_db: str):
         c.execute(insert, (T, T, ran_at, closed))
     c.execute(insert, (T, T, None, None))
     c.execute(insert, (T, T + timedelta(hours=1), None, None))  # a stamp after the run is allowed (owner, 2026-10-27)
+
+
+def test_report_recipients_seed_and_checks(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    assert c.execute("SELECT report, email FROM backend.report_recipients").fetchall() == [
+      ("payroll_report", "jacob.ogden@sweetfiretobacco.com")
+    ]
+    for bad in ("Someone@example.com", "nope", "a@b"):
+      with pytest.raises(errors.CheckViolation):
+        c.execute("INSERT INTO backend.report_recipients VALUES ('payroll_report', %s)", (bad,))
+    with pytest.raises(errors.UniqueViolation):
+      c.execute("INSERT INTO backend.report_recipients VALUES ('payroll_report', 'jacob.ogden@sweetfiretobacco.com')")
+    c.execute("INSERT INTO backend.report_recipients VALUES ('other_report', 'jacob.ogden@sweetfiretobacco.com')")
 
 
 def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login: str):
