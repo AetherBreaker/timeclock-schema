@@ -364,3 +364,10 @@ class ReportSend(TimeclockModel):
   status: str
   finished_at: UtcDatetime | None = None
   error: str | None = None
+
+
+class ReportSchedule(TimeclockModel):
+  """`backend.report_schedules` row: a scheduled report's cron line, in the backend's zone. Only production's rows are read."""
+
+  report: str
+  cron: str

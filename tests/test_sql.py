@@ -45,6 +45,7 @@ from timeclock_schema.models import (
   Punch,
   PunchCorrection,
   ReportRecipient,
+  ReportSchedule,
   ReportSend,
   RuleRow,
   ScheduledRun,
@@ -1040,6 +1041,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
       ("backend.scheduled_runs", ScheduledRun),
       ("backend.report_recipients", ReportRecipient),
       ("backend.report_sends", ReportSend),
+      ("backend.report_schedules", ReportSchedule),
     ]
     with c.cursor(row_factory=dict_row) as cur:
       loaded = {table: [model.model_validate(row) for row in cur.execute(f"SELECT * FROM {table}")] for table, model in tables}
@@ -1061,6 +1063,7 @@ def test_every_table_loads_into_its_model(fresh_db: str, make_editor: Callable[.
     "backend.scheduled_runs": 1,
     "backend.report_recipients": 1,  # the migration's seed
     "backend.report_sends": 1,
+    "backend.report_schedules": 1,  # the migration's seed
   }
   assert loaded["config.business_hours"][0] == BusinessHours(id=1, weekday=7, opens=time(9), closes=time(23, 59, 59))
   assert loaded["rules"][0].model_dump()["params"] == {"n": 1}
@@ -1093,6 +1096,27 @@ def test_report_recipients_seed_and_checks(fresh_db: str):
     with pytest.raises(errors.UniqueViolation):
       c.execute("INSERT INTO backend.report_recipients VALUES ('payroll_report', 'jacob.ogden@sweetfiretobacco.com')")
     c.execute("INSERT INTO backend.report_recipients VALUES ('other_report', 'jacob.ogden@sweetfiretobacco.com')")
+
+
+def test_report_schedules_seed_and_checks(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as c:
+    assert c.execute("SELECT report, cron FROM backend.report_schedules").fetchall() == [("payroll_report", "0 13 * * TUE")]
+    with pytest.raises(errors.CheckViolation):
+      c.execute("INSERT INTO backend.report_schedules VALUES ('other_report', '  ')")
+    with pytest.raises(errors.NotNullViolation):
+      c.execute("INSERT INTO backend.report_schedules VALUES ('other_report', NULL)")
+    with pytest.raises(errors.UniqueViolation):
+      c.execute("INSERT INTO backend.report_schedules VALUES ('payroll_report', '0 6 * * MON')")
+
+
+def test_a_schedule_change_pings_report_schedules(fresh_db: str):
+  with psycopg.connect(fresh_db, autocommit=True) as listener, psycopg.connect(fresh_db, autocommit=True) as c:
+    listener.execute("LISTEN report_schedules")
+    c.execute("UPDATE backend.report_schedules SET cron = '0 6 * * MON' WHERE report = 'payroll_report'")
+    c.execute("INSERT INTO backend.report_schedules VALUES ('other_report', '0 6 * * MON')")
+    c.execute("DELETE FROM backend.report_schedules WHERE report = 'other_report'")
+    pings = [n.payload for n in listener.notifies(timeout=5, stop_after=3)]
+  assert pings == ["payroll_report", "other_report", "other_report"]
 
 
 _SEND = "INSERT INTO backend.report_sends (report, week_start, recipients) VALUES ('payroll_report', %s, %s)"
@@ -1186,6 +1210,7 @@ def test_clock_login_cannot_reach_the_backend_schema(fresh_db: str, clock_login:
       "SELECT backend.project_auto_clock_out_runs()",
       "SELECT * FROM backend.report_recipients",
       "SELECT * FROM backend.report_sends",
+      "SELECT * FROM backend.report_schedules",
     ]
     for statement in statements:
       with pytest.raises(errors.InsufficientPrivilege):
